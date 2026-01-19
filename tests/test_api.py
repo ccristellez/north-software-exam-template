@@ -60,6 +60,7 @@ class TestCreatePingEndpoint:
         mock_redis.sadd.return_value = 1
         mock_redis.scard.return_value = 5
         mock_redis.expire.return_value = True
+        mock_redis.xadd.return_value = "1234567890-0"  # Mock stream event ID
 
         ping_data = {
             "device_id": "device123",
@@ -85,11 +86,15 @@ class TestCreatePingEndpoint:
         expire_call_args = mock_redis.expire.call_args
         assert expire_call_args[0][1] == 300  # TTL = 300 seconds
 
+        # Verify event was published to stream
+        mock_redis.xadd.assert_called()
+
     def test_create_ping_with_timestamp(self, client, mock_redis):
         """Test ping creation with explicit timestamp."""
         mock_redis.sadd.return_value = 1
         mock_redis.scard.return_value = 1
         mock_redis.expire.return_value = True
+        mock_redis.xadd.return_value = "1234567890-0"
 
         ts = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
         ping_data = {
@@ -145,6 +150,7 @@ class TestCreatePingEndpoint:
         mock_redis.sadd.side_effect = [1, 0]  # 1st ping adds, 2nd ping already exists
         mock_redis.scard.side_effect = [1, 1]  # Count remains 1 for both
         mock_redis.expire.return_value = True
+        mock_redis.xadd.return_value = "1234567890-0"
 
         ping_data = {
             "device_id": "device123",

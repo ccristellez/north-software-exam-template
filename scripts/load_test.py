@@ -16,16 +16,15 @@ import json
 
 try:
     import httpx
-    import rich
-    from rich.console import Console
-    from rich.table import Table
-    from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
-    from rich.panel import Panel
 except ImportError:
-    print("Error: Missing dependencies. Install with: pip install httpx rich")
+    print("Error: Missing httpx. Install with: pip install httpx")
     exit(1)
 
-console = Console()
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
 
 
 # NYC area coordinates for realistic test data
@@ -184,26 +183,16 @@ async def run_load_test(
                 return result
 
         # Send ping requests
-        with Progress(
-            SpinnerColumn(),
-            *Progress.get_default_columns(),
-            TimeElapsedColumn(),
-            console=console
-        ) as progress:
+        print(f"Sending {num_requests} pings...")
+        tasks = [limited_send_ping(i) for i in range(num_requests)]
 
-            task = progress.add_task(
-                f"Sending {num_requests} pings...",
-                total=num_requests
-            )
-
-            # Create tasks for all requests
-            tasks = [limited_send_ping(i) for i in range(num_requests)]
-
-            # Execute with progress updates
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
-                results["ping_results"].append(result)
-                progress.advance(task)
+        completed = 0
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            results["ping_results"].append(result)
+            completed += 1
+            if completed % 100 == 0:
+                print(f"  {completed}/{num_requests} completed")
 
         # Optionally send congestion queries
         if include_queries:
@@ -215,24 +204,16 @@ async def run_load_test(
                     result = await send_congestion_query(client, base_url, lat, lon)
                     return result
 
-            with Progress(
-                SpinnerColumn(),
-                *Progress.get_default_columns(),
-                TimeElapsedColumn(),
-                console=console
-            ) as progress:
+            print(f"Sending {num_queries} congestion queries...")
+            tasks = [limited_send_query() for i in range(num_queries)]
 
-                task = progress.add_task(
-                    f"Sending {num_queries} congestion queries...",
-                    total=num_queries
-                )
-
-                tasks = [limited_send_query() for i in range(num_queries)]
-
-                for coro in asyncio.as_completed(tasks):
-                    result = await coro
-                    results["query_results"].append(result)
-                    progress.advance(task)
+            completed = 0
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                results["query_results"].append(result)
+                completed += 1
+                if completed % 10 == 0:
+                    print(f"  {completed}/{num_queries} completed")
 
     results["end_time"] = time.time()
     return results
@@ -294,74 +275,49 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
 
 def display_results(metrics: Dict[str, Any], config: Dict[str, Any]):
     """Display test results in a formatted table."""
-    console.print()
-    console.print(Panel.fit(
-        "Load Test Results"
-    ))
-    console.print()
+    print("\n" + "="*60)
+    print("LOAD TEST RESULTS")
+    print("="*60 + "\n")
 
-    # Configuration table
-    config_table = Table(title="Test Configuration", show_header=False)
-    config_table.add_column("Parameter")
-    config_table.add_column("Value")
+    # Configuration
+    print("Test Configuration:")
+    print(f"  Base URL:         {config['base_url']}")
+    print(f"  Total Requests:   {config['num_requests']}")
+    print(f"  Unique Devices:   {config['num_devices']}")
+    print(f"  Concurrent Limit: {config['concurrent_limit']}")
+    print(f"  Total Duration:   {metrics['total_duration']:.2f}s")
+    print()
 
-    config_table.add_row("Base URL", config["base_url"])
-    config_table.add_row("Total Requests", str(config["num_requests"]))
-    config_table.add_row("Unique Devices", str(config["num_devices"]))
-    config_table.add_row("Concurrent Limit", str(config["concurrent_limit"]))
-    config_table.add_row("Total Duration", f"{metrics['total_duration']:.2f}s")
-
-    console.print(config_table)
-    console.print()
-
-    # Ping metrics table
+    # Ping metrics
     ping_metrics = metrics["ping_metrics"]
+    print("Ping Request Metrics:")
+    print(f"  Total Requests: {ping_metrics['total']}")
+    print(f"  Successful:     {ping_metrics['success']} ({ping_metrics['success_rate']:.1f}%)")
+    print(f"  Failed:         {ping_metrics['failed']}")
+    print(f"  Throughput:     {ping_metrics['throughput']:.1f} req/s")
+    print()
 
-    results_table = Table(title="Ping Request Metrics")
-    results_table.add_column("Metric")
-    results_table.add_column("Value")
-
-    results_table.add_row("Total Requests", str(ping_metrics["total"]))
-    results_table.add_row("Successful", f"{ping_metrics['success']} ({ping_metrics['success_rate']:.1f}%)")
-    results_table.add_row("Failed", str(ping_metrics["failed"]))
-    results_table.add_row("Throughput", f"{ping_metrics['throughput']:.1f} req/s")
-
-    console.print(results_table)
-    console.print()
-
-    # Latency table
+    # Latency
     latency = ping_metrics["latency"]
-
-    latency_table = Table(title="Ping Latency (milliseconds)")
-    latency_table.add_column("Percentile")
-    latency_table.add_column("Latency")
-
-    latency_table.add_row("Min", f"{latency['min']:.2f} ms")
-    latency_table.add_row("Mean", f"{latency['mean']:.2f} ms")
-    latency_table.add_row("Median", f"{latency['median']:.2f} ms")
-    latency_table.add_row("P95", f"{latency['p95']:.2f} ms")
-    latency_table.add_row("P99", f"{latency['p99']:.2f} ms")
-    latency_table.add_row("Max", f"{latency['max']:.2f} ms")
-
-    console.print(latency_table)
-    console.print()
+    print("Ping Latency (milliseconds):")
+    print(f"  Min:    {latency['min']:.2f} ms")
+    print(f"  Mean:   {latency['mean']:.2f} ms")
+    print(f"  Median: {latency['median']:.2f} ms")
+    print(f"  P95:    {latency['p95']:.2f} ms")
+    print(f"  P99:    {latency['p99']:.2f} ms")
+    print(f"  Max:    {latency['max']:.2f} ms")
+    print()
 
     # Query metrics (if available)
     if "query_metrics" in metrics:
         query_metrics = metrics["query_metrics"]
-
-        query_table = Table(title="Congestion Query Metrics")
-        query_table.add_column("Metric")
-        query_table.add_column("Value")
-
-        query_table.add_row("Total Queries", str(query_metrics["total"]))
-        query_table.add_row("Successful", f"{query_metrics['success']} ({query_metrics['success_rate']:.1f}%)")
-        query_table.add_row("Failed", str(query_metrics["failed"]))
-        query_table.add_row("Throughput", f"{query_metrics['throughput']:.1f} req/s")
-        query_table.add_row("Mean Latency", f"{query_metrics['latency']['mean']:.2f} ms")
-
-        console.print(query_table)
-        console.print()
+        print("Congestion Query Metrics:")
+        print(f"  Total Queries: {query_metrics['total']}")
+        print(f"  Successful:    {query_metrics['success']} ({query_metrics['success_rate']:.1f}%)")
+        print(f"  Failed:        {query_metrics['failed']}")
+        print(f"  Throughput:    {query_metrics['throughput']:.1f} req/s")
+        print(f"  Mean Latency:  {query_metrics['latency']['mean']:.2f} ms")
+        print()
 
     # Performance summary
     if ping_metrics["success_rate"] >= 99.9:
@@ -371,11 +327,10 @@ def display_results(metrics: Dict[str, Any], config: Dict[str, Any]):
     else:
         status = "NEEDS IMPROVEMENT"
 
-    console.print(Panel.fit(
-        f"Performance Status: {status}\n"
-        f"Handled {ping_metrics['throughput']:.0f} requests/second with "
-        f"{latency['p95']:.1f}ms P95 latency"
-    ))
+    print("="*60)
+    print(f"Performance Status: {status}")
+    print(f"Handled {ping_metrics['throughput']:.0f} requests/second with {latency['p95']:.1f}ms P95 latency")
+    print("="*60 + "\n")
 
 
 def save_results(metrics: Dict[str, Any], config: Dict[str, Any], filename: str):
@@ -389,7 +344,7 @@ def save_results(metrics: Dict[str, Any], config: Dict[str, Any], filename: str)
     with open(filename, "w") as f:
         json.dump(output, f, indent=2)
 
-    console.print(f"\nResults saved to {filename}")
+    print(f"Results saved to {filename}")
 
 
 async def main():
@@ -440,26 +395,23 @@ async def main():
         "include_queries": args.with_queries
     }
 
-    console.print(Panel.fit(
-        "Congestion Monitor API Load Test\n"
-        f"Preparing to send {args.requests} requests with {args.concurrent} concurrent connections"
-    ))
-    console.print()
+    print("\n" + "="*60)
+    print("Congestion Monitor API Load Test")
+    print(f"Preparing to send {args.requests} requests with {args.concurrent} concurrent connections")
+    print("="*60 + "\n")
 
     # Check if API is reachable
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(f"{args.url}/health", timeout=5.0)
             if response.status_code == 200:
-                console.print("OK API is reachable")
+                print("OK API is reachable\n")
             else:
-                console.print(f"WARN API returned status {response.status_code}")
+                print(f"WARN API returned status {response.status_code}\n")
     except Exception as e:
-        console.print(f"ERROR Cannot reach API: {e}")
-        console.print("Make sure the API is running on the specified URL")
+        print(f"ERROR Cannot reach API: {e}")
+        print("Make sure the API is running on the specified URL\n")
         return
-
-    console.print()
 
     # Run load test
     results = await run_load_test(
@@ -476,6 +428,37 @@ async def main():
 
     # Save results
     save_results(metrics, config, args.output)
+
+    # Show event stream stats if Redis is available
+    if REDIS_AVAILABLE:
+        print_stream_stats()
+
+
+def print_stream_stats():
+    """Print Redis Stream statistics after the test."""
+    try:
+        r = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True)
+        r.ping()
+
+        stream_name = "congestion:events"
+        stream_length = r.xlen(stream_name)
+
+        print("\nEvent Stream Stats:")
+        print(f"  Stream: {stream_name}")
+        print(f"  Total events: {stream_length}")
+
+        # Count event types
+        events = r.xrange(stream_name, count=1000)
+        ping_count = sum(1 for _, data in events if data.get("event_type") == "ping_received")
+        alert_count = sum(1 for _, data in events if data.get("event_type") == "high_congestion")
+
+        print(f"  Ping events: {ping_count}")
+        print(f"  High congestion alerts: {alert_count}")
+        print()
+
+    except Exception as e:
+        # Silently skip if Redis not available or stream doesn't exist
+        pass
 
 
 if __name__ == "__main__":
