@@ -1,28 +1,35 @@
 {
   "config": {
     "base_url": "http://localhost:8000",
-    "num_requests": 1000,
+    "num_requests": 500,
     "num_devices": 100,
     "concurrent_limit": 50,
-    "include_queries": false
+    "include_queries": false,
+    "congestion_mode": "moderate"
   },
   "metrics": {
-    "total_duration": 1.8111436367034912,
+    "total_duration": 1.1487205028533936,
     "ping_metrics": {
-      "total": 1000,
-      "success": 1000,
+      "total": 500,
+      "success": 500,
       "failed": 0,
       "success_rate": 100.0,
-      "throughput": 552.1373234759699,
+      "throughput": 435.26688934167385,
       "latency": {
-        "min": 31.149900001764763,
-        "max": 342.07059999971534,
-        "mean": 79.43483380012549,
-        "median": 57.933399999456014,
-        "p95": 304.98972500226955,
-        "p99": 336.191166000026
+        "min": 39.43390000495128,
+        "max": 361.78300000028685,
+        "mean": 94.96846620037104,
+        "median": 66.2281500044628,
+        "p95": 334.5529050071491,
+        "p99": 358.50373899840633
+      },
+      "speed_data": {
+        "pings_with_speed": 500,
+        "avg_speed_kmh": 35.0,
+        "min_speed_kmh": 25.0,
+        "max_speed_kmh": 45.0
       }
     }
   },
-  "timestamp": "2026-01-19T00:23:20.166736+00:00"
+  "timestamp": "2026-01-19T20:35:53.651112+00:00"
 }

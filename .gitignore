@@ -1,3 +1,6 @@
+# Environment variables (contains secrets)
+.env
+
 # Virtual environment
 venv/
 
@@ -12,6 +15,7 @@ __pycache__/
 
 # Testing
 .pytest_cache/
+load_test_results.json
 
 # Logs
 *.log

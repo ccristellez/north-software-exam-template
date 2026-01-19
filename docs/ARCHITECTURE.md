@@ -24,33 +24,37 @@
 │                            FastAPI Application                                    │
 │  ┌────────────────────────────────────────────────────────────────────────────┐  │
 │  │                              Endpoints                                      │  │
-│  │  POST /v1/pings          - Receive device location pings                   │  │
-│  │  GET  /v1/congestion     - Query single cell congestion                    │  │
+│  │  POST /v1/pings          - Receive device location pings (with speed)      │  │
+│  │  GET  /v1/congestion     - Query single cell congestion (Z-score based)    │  │
 │  │  GET  /v1/congestion/area - Query area congestion (k-ring)                 │  │
+│  │  GET  /v1/baseline       - Get historical baseline for a cell              │  │
+│  │  POST /v1/baseline/update - Update baseline from current bucket            │  │
 │  │  GET  /health            - Health check                                    │  │
 │  │  GET  /metrics           - Prometheus metrics                              │  │
 │  └────────────────────────────────────────────────────────────────────────────┘  │
 │                                                                                   │
 │  ┌─────────────────────┐  ┌─────────────────────┐  ┌────────────────────────┐   │
-│  │   H3 Grid Module    │  │   Time Bucketing    │  │   Metrics Module       │   │
+│  │   H3 Grid Module    │  │   Time Bucketing    │  │   Congestion Module    │   │
 │  │                     │  │                     │  │                        │   │
-│  │ • lat/lon → cell_id │  │ • 5-min windows     │  │ • Request counters     │   │
-│  │ • Resolution 8      │  │ • Auto-expiring     │  │ • Latency histograms   │   │
-│  │ • ~460m hexagons    │  │   buckets           │  │ • Business metrics     │   │
+│  │ • lat/lon → cell_id │  │ • 5-min windows     │  │ • Z-score calculation  │   │
+│  │ • Resolution 8      │  │ • Auto-expiring     │  │ • Historical baselines │   │
+│  │ • ~460m hexagons    │  │   buckets           │  │ • Fallback thresholds  │   │
 │  │ • k-ring neighbors  │  │                     │  │                        │   │
 │  └─────────────────────┘  └─────────────────────┘  └────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────────────────────┘
                        │
-                       │ Redis Protocol
-                       ▼
-         ┌─────────────────────────────┐
-         │          Redis              │            (ElastiCache in prod)
-         │                             │
-         │  Key: cell:{h3_id}:bucket:{t}│
-         │  Value: SET of device_ids   │
-         │  TTL: 300 seconds           │
-         │                             │
-         └─────────────────────────────┘
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+┌─────────────────────────┐  ┌──────────────────────────┐
+│         Redis           │  │   Supabase PostgreSQL    │
+│    (Real-time data)     │  │    (Historical data)     │
+│                         │  │                          │
+│ • Device counts (SET)   │  │ • Baseline avg_speed     │
+│ • Speed readings (LIST) │  │ • Baseline avg_count     │
+│ • TTL: 300 seconds      │  │ • Variance values        │
+│ • ElastiCache in prod   │  │ • Sample counts          │
+└─────────────────────────┘  └──────────────────────────┘
 
 
 ## Data Flow
@@ -59,7 +63,8 @@
 
 ┌────────┐    POST /v1/pings     ┌─────────┐    SADD      ┌───────┐
 │ Device │ ──────────────────────▶│ FastAPI │─────────────▶│ Redis │
-│        │  {device_id,lat,lon}  │         │              │       │
+│        │ {device_id,lat,lon,   │         │   + RPUSH    │       │
+│        │  speed_kmh}           │         │   (speeds)   │       │
 └────────┘                       └─────────┘              └───────┘
                                       │
                                       ▼
@@ -82,19 +87,27 @@
                               └───────────────────────────────┘
 
 
-### 2. Congestion Query Flow
+### 2. Congestion Query Flow (Z-Score Based)
 
-┌────────┐   GET /v1/congestion   ┌─────────┐   SCARD     ┌───────┐
-│ Client │ ──────────────────────▶│ FastAPI │────────────▶│ Redis │
-│        │    ?lat=X&lon=Y        │         │◀────────────│       │
-└────────┘                        └─────────┘   count     └───────┘
+┌────────┐   GET /v1/congestion   ┌─────────┐
+│ Client │ ──────────────────────▶│ FastAPI │
+│        │    ?lat=X&lon=Y        │         │
+└────────┘                        └────┬────┘
                                        │
+                        ┌──────────────┴──────────────┐
+                        ▼                             ▼
+                 ┌─────────────┐              ┌──────────────┐
+                 │    Redis    │              │   Supabase   │
+                 │ count+speed │              │   baseline   │
+                 └──────┬──────┘              └──────┬───────┘
+                        │                            │
+                        └──────────────┬─────────────┘
                                        ▼
                                ┌───────────────┐
-                               │ Classify:     │
-                               │ <10  → LOW    │
-                               │ <30  → MOD    │
-                               │ 30+  → HIGH   │
+                               │ Z-Score Calc: │
+                               │ Z > 1.5 →HIGH │
+                               │ Z > 0.5 →MOD  │
+                               │ else   →LOW   │
                                └───────────────┘
 
 
@@ -122,7 +135,39 @@
                                   └───────────────┘
 
 
-### 4. Event-Driven Flow (Redis Streams)
+### 4. Baseline Update Flow
+
+Baselines are updated from bucket data and stored in Supabase for persistence.
+
+```
+┌─────────┐  POST /v1/baseline/update  ┌─────────┐
+│ Client  │ ──────────────────────────▶│ FastAPI │
+└─────────┘                            └────┬────┘
+                                            │
+                            ┌───────────────┴───────────────┐
+                            ▼                               ▼
+                     ┌─────────────┐               ┌───────────────┐
+                     │    Redis    │               │   Supabase    │
+                     │ get bucket  │               │ get baseline  │
+                     │ count+speed │               │               │
+                     └──────┬──────┘               └───────┬───────┘
+                            │                              │
+                            └──────────────┬───────────────┘
+                                           ▼
+                                   ┌───────────────┐
+                                   │   EMA Update  │
+                                   │ α=0.1 weight  │
+                                   │ to new data   │
+                                   └───────┬───────┘
+                                           │
+                                           ▼
+                                   ┌───────────────┐
+                                   │   Supabase    │
+                                   │ save baseline │
+                                   └───────────────┘
+```
+
+### 5. Event-Driven Flow (Redis Streams)
 
 Every ping is also published to a Redis Stream for downstream processing.
 When congestion hits HIGH, an alert event is also published.
@@ -176,29 +221,54 @@ Resolution 8 hexagons (~460m edge):
         ╲╱     ╲╱     ╲╱
 ```
 
-## Redis Data Model
+## Redis Data Model (Real-time)
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│                        Redis Keys                               │
+│                    Redis Keys - Device Counts                   │
 ├────────────────────────────────────────────────────────────────┤
 │ Key Pattern: cell:{h3_cell_id}:bucket:{time_bucket}            │
-│                                                                 │
 │ Example:     cell:882a100d63fffff:bucket:6043212               │
-│                    └──────┬──────┘       └───┬───┘             │
-│                      H3 cell ID        Unix ts / 300           │
-│                                                                 │
-│ Value Type:  SET                                                │
-│ Members:     device_id strings                                  │
-│                                                                 │
-│ TTL:         300 seconds (auto-expire after window closes)      │
+│ Value Type:  SET of device_id strings                          │
+│ TTL:         300 seconds                                        │
+├────────────────────────────────────────────────────────────────┤
+│                    Redis Keys - Speed Readings                  │
+├────────────────────────────────────────────────────────────────┤
+│ Key Pattern: cell:{h3_cell_id}:bucket:{time_bucket}:speeds     │
+│ Example:     cell:882a100d63fffff:bucket:6043212:speeds        │
+│ Value Type:  LIST of speed_kmh floats                          │
+│ TTL:         300 seconds                                        │
 └────────────────────────────────────────────────────────────────┘
 
 Benefits:
 • SET ensures unique device counting (no duplicates)
-• SADD is O(1) - fast writes
+• LIST stores all speed readings for averaging
+• SADD/RPUSH are O(1) - fast writes
 • SCARD is O(1) - fast reads
 • TTL auto-cleans old data - no manual cleanup needed
+```
+
+
+## Supabase Data Model (Historical)
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                   Table: hex_baselines                          │
+├────────────────────────────────────────────────────────────────┤
+│ cell_id         VARCHAR(20)  PRIMARY KEY   H3 cell identifier  │
+│ avg_speed       FLOAT        DEFAULT 0     Historical avg km/h │
+│ avg_count       FLOAT        DEFAULT 0     Historical avg count│
+│ speed_variance  FLOAT        DEFAULT 0     For std deviation   │
+│ count_variance  FLOAT        DEFAULT 0     For std deviation   │
+│ sample_count    INT          DEFAULT 0     Calibration progress│
+│ updated_at      TIMESTAMPTZ  DEFAULT NOW() Last update time    │
+└────────────────────────────────────────────────────────────────┘
+
+Benefits:
+• Durable storage survives restarts (unlike Redis)
+• Easy to query and analyze baseline data
+• Exponential moving average (EMA) weights recent data
+• Cell is "calibrated" after 50+ samples
 ```
 
 
@@ -285,7 +355,9 @@ Benefits of Redis Streams:
 | API Layer | Request handling, validation, routing | FastAPI |
 | Grid Module | Spatial indexing, coordinate conversion | H3 library |
 | Time Module | Temporal bucketing, window management | Python datetime |
-| Data Store | Device counting, TTL-based expiration | Redis Sets |
+| Real-time Data | Device counting, TTL-based expiration | Redis Sets |
+| Historical Data | Baseline storage for Z-score calibration | Supabase PostgreSQL |
+| Congestion | Z-score based level detection | Python (congestion.py) |
 | Events | Event publishing for downstream consumers | Redis Streams |
 | Metrics | Observability, performance monitoring | Prometheus |
 | Infrastructure | Deployment, scaling, networking | Terraform + AWS |

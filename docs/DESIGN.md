@@ -41,10 +41,15 @@ Resolution 8:  ~460m edge   → Good balance for city traffic ✓
 Resolution 9:  ~174m edge   → Too fine, too many cells to query
 ```
 
-Resolution 8 chosen because:
-- Covers roughly one city block
-- Area queries with k=2 (~19 cells) cover ~1km radius
-- Balances granularity vs. query cost
+**Why H3 Resolution 8?**
+
+Resolution 8 (~460m cells) was chosen because it matches the natural scale of traffic variation:
+
+- **Approximates 2-4 city blocks** - This is the granularity at which congestion actually varies in urban environments. One intersection can be jammed while the next block flows freely.
+- **Small enough for localized detection** - Can distinguish congestion at one intersection vs. another a few hundred meters away.
+- **Large enough for meaningful counts** - A reasonable number of devices (10-30) can populate a single cell during rush hour, giving statistically meaningful congestion readings.
+- **Aligns with industry visualization** - Google Maps and Waze color traffic at roughly this granularity—road segments of a few hundred meters, not entire neighborhoods.
+- **Practical query radius** - Area queries with k=2 (~19 cells) cover approximately 1km, suitable for "what's traffic like around here?" queries.
 
 ---
 
@@ -129,43 +134,58 @@ HyperLogLog would use less memory but:
 
 ---
 
-## 4. Congestion Thresholds
+## 4. Congestion Detection: Z-Score Based with Historical Baselines
 
 ### Decision
-Simple threshold-based classification:
+Self-calibrating congestion detection using Z-scores against historical baselines, with fallback to simple thresholds for uncalibrated cells.
+
+### How It Works
+
+Each hexagon cell learns its own "normal" traffic patterns over time:
 
 ```
-LOW:      0-9 vehicles
-MODERATE: 10-29 vehicles
-HIGH:     30+ vehicles
+1. Collect data: avg_speed, avg_count, and their variances
+2. After 50+ samples, cell is "calibrated"
+3. Z-score = (current - historical_mean) / std_deviation
+4. Combined Z-score from speed + count determines level:
+   - Z > 1.5  → HIGH congestion
+   - Z > 0.5  → MODERATE congestion
+   - Z ≤ 0.5  → LOW congestion
 ```
 
-### Why These Numbers?
+### Fallback Thresholds (Uncalibrated Cells)
 
-Based on typical urban traffic density:
-- H3 resolution 8 cell ≈ 0.74 km²
-- 30 vehicles in this area = significant congestion
-- 10 vehicles = notable but flowing traffic
+When a cell has < 50 samples, use absolute thresholds:
+```
+Speed-based:
+- < 15 km/h → HIGH
+- < 40 km/h → MODERATE
 
-### Trade-offs Accepted
+Count-based:
+- 30+ vehicles → HIGH
+- 10+ vehicles → MODERATE
+```
 
-**Chose simple thresholds because:**
-- Easy to understand and explain
-- Fast to compute (no ML, no historical comparison)
-- Can be tuned via configuration
+### Why Z-Scores?
 
-**Accepted downsides:**
-- Doesn't account for road capacity (highway vs. residential)
-- Doesn't consider time-of-day patterns
-- Same thresholds everywhere (NYC vs. suburbs)
+**Chose Z-score based detection because:**
+- Self-calibrating (highway vs. residential adapts automatically)
+- Accounts for time-of-day patterns as baselines build up
+- Combines both speed and count signals
+- No manual per-cell configuration needed
 
-### Future Improvements
+**Trade-offs accepted:**
+- Requires time to build baselines (50 samples minimum)
+- Storage needed for historical data (Supabase PostgreSQL)
+- More complex than simple thresholds
 
-If given more time:
-- Per-cell threshold configuration
-- ML-based anomaly detection
-- Historical baseline comparison
-- Road network awareness
+### Storage
+
+Historical baselines stored in Supabase PostgreSQL:
+- `avg_speed`, `avg_count`: Exponential moving averages
+- `speed_variance`, `count_variance`: For standard deviation
+- `sample_count`: Tracks calibration progress
+- Updated via `/v1/baseline/update` endpoint
 
 ---
 
@@ -357,8 +377,8 @@ At 10,000 pings/second:
 
 At 100,000 pings/second:
 ├── API Gateway: ✓ (still fine)
-├── Lambda: ⚠️ (need concurrency increase)
-├── Redis: ⚠️ (need cluster mode)
+├── Lambda:(need concurrency increase)
+├── Redis: (need cluster mode)
 └── Network: ✓
 ```
 
@@ -415,18 +435,18 @@ How Google Maps and Waze actually detect congestion:
 
 **Why not implemented:** Current data model treats pings as independent events. Would need vehicle tracking and more frequent pings to calculate reliable speeds.
 
-#### Historical Comparison
-Compare current vehicle count to historical average for that cell/time:
-- Store rolling averages per cell per hour-of-day per day-of-week
-- Congestion = current count significantly exceeds historical baseline
+#### Historical Comparison (IMPLEMENTED)
+Compare current values to historical average for that cell using Z-scores:
+- Store rolling averages per cell (avg_speed, avg_count, variances)
+- Congestion = current values significantly deviate from historical baseline
 - Automatically adapts to each location's normal traffic patterns
 
 **Benefits:**
 - Self-calibrating (highway vs. residential street)
-- Accounts for time-of-day patterns (rush hour vs. midnight)
+- Combines both speed and count signals
 - No manual threshold tuning needed
 
-**Implementation:** Could use Redis sorted sets or a time-series database to store historical baselines.
+**Implementation:** Uses Supabase PostgreSQL to store historical baselines with exponential moving average updates.
 
 #### Density-Based (Vehicles per km)
 Normalize vehicle count by road segment length:
@@ -443,13 +463,12 @@ Trigger on sudden changes rather than absolute values:
 ### If Given More Time
 
 **Short-term:**
-1. Historical baseline comparison (most impactful improvement)
-2. WebSocket endpoint for real-time congestion push
-3. Per-region threshold configuration
-4. Batch ping ingestion endpoint
+1. WebSocket endpoint for real-time congestion push
+2. Per-region threshold configuration overrides
+3. Batch ping ingestion endpoint
 
 **Medium-term:**
-1. Speed-based detection (if vehicle tracking data available)
+1. Vehicle tracking for velocity-based detection (across multiple pings)
 2. Event-driven architecture (SQS/SNS for decoupling)
 3. ML-based anomaly detection
 4. Integration with external traffic data (road network, incidents)

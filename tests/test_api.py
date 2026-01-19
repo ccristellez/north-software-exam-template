@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 from unittest.mock import Mock, patch, MagicMock
 from src.api.main import app
+from src.api.congestion import CellBaseline
 
 
 @pytest.fixture
@@ -16,8 +17,17 @@ def client():
 
 @pytest.fixture
 def mock_redis():
-    """Create a mock Redis client."""
-    return Mock()
+    """Create a mock Redis client for real-time data (speeds, counts)."""
+    mock = Mock()
+    # Default returns for speed data (still in Redis)
+    mock.lrange.return_value = []  # No speeds by default
+    return mock
+
+
+@pytest.fixture
+def mock_empty_baseline():
+    """Patch get_baseline to return empty baseline (no history)."""
+    return patch("src.api.congestion.get_baseline", return_value=CellBaseline())
 
 
 @pytest.mark.unit
@@ -207,12 +217,14 @@ class TestPingCountEndpoint:
 class TestCongestionEndpoint:
     """Test suite for GET /v1/congestion endpoint."""
 
-    def test_congestion_low(self, client, mock_redis):
-        """Test congestion endpoint with low traffic."""
+    def test_congestion_low(self, client, mock_redis, mock_empty_baseline):
+        """Test congestion endpoint with low traffic (fallback mode, no baseline)."""
         mock_redis.scard.return_value = 5
+        mock_redis.lrange.return_value = []  # No speed data
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
 
         assert response.status_code == 200
         data = response.json()
@@ -220,50 +232,72 @@ class TestCongestionEndpoint:
         assert data["vehicle_count"] == 5
         assert "cell_id" in data
         assert data["window_seconds"] == 300
+        assert data["calibrated"] == False  # No baseline yet
 
-    def test_congestion_moderate(self, client, mock_redis):
-        """Test congestion endpoint with moderate traffic."""
+    def test_congestion_moderate(self, client, mock_redis, mock_empty_baseline):
+        """Test congestion endpoint with moderate traffic (fallback mode)."""
         mock_redis.scard.return_value = 15
+        mock_redis.lrange.return_value = []
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
 
         assert response.status_code == 200
         data = response.json()
         assert data["congestion_level"] == "MODERATE"
         assert data["vehicle_count"] == 15
 
-    def test_congestion_high(self, client, mock_redis):
-        """Test congestion endpoint with high traffic."""
+    def test_congestion_high(self, client, mock_redis, mock_empty_baseline):
+        """Test congestion endpoint with high traffic (fallback mode)."""
         mock_redis.scard.return_value = 35
+        mock_redis.lrange.return_value = []
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
 
         assert response.status_code == 200
         data = response.json()
         assert data["congestion_level"] == "HIGH"
         assert data["vehicle_count"] == 35
 
-    def test_congestion_threshold_boundaries(self, client, mock_redis):
-        """Test congestion level at threshold boundaries."""
-        # Exactly 10 vehicles = MODERATE
-        mock_redis.scard.return_value = 10
-        with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
-            assert response.json()["congestion_level"] == "MODERATE"
+    def test_congestion_threshold_boundaries(self, client, mock_redis, mock_empty_baseline):
+        """Test congestion level at threshold boundaries (fallback mode)."""
+        mock_redis.lrange.return_value = []
 
-        # Exactly 30 vehicles = HIGH
-        mock_redis.scard.return_value = 30
-        with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
-            assert response.json()["congestion_level"] == "HIGH"
+        with mock_empty_baseline:
+            # Exactly 10 vehicles = MODERATE
+            mock_redis.scard.return_value = 10
+            with patch("src.api.main.get_redis_client", return_value=mock_redis):
+                response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
+                assert response.json()["congestion_level"] == "MODERATE"
 
-        # 9 vehicles = LOW
-        mock_redis.scard.return_value = 9
+            # Exactly 30 vehicles = HIGH
+            mock_redis.scard.return_value = 30
+            with patch("src.api.main.get_redis_client", return_value=mock_redis):
+                response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
+                assert response.json()["congestion_level"] == "HIGH"
+
+            # 9 vehicles = LOW
+            mock_redis.scard.return_value = 9
+            with patch("src.api.main.get_redis_client", return_value=mock_redis):
+                response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
+                assert response.json()["congestion_level"] == "LOW"
+
+    def test_congestion_with_speed_data(self, client, mock_redis, mock_empty_baseline):
+        """Test congestion with speed data (fallback mode, low speed = high congestion)."""
+        mock_redis.scard.return_value = 5  # Low count
+        mock_redis.lrange.return_value = [b'10', b'12', b'8']  # Very slow speeds
+
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
-            assert response.json()["congestion_level"] == "LOW"
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion?lat=40.7128&lon=-74.0060")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["avg_speed_kmh"] == 10.0  # Average of 10, 12, 8
+        assert data["congestion_level"] == "HIGH"  # Low speed = high congestion
 
     def test_congestion_missing_parameters(self, client):
         """Test congestion endpoint without required parameters."""
@@ -280,12 +314,14 @@ class TestCongestionEndpoint:
 class TestCongestionAreaEndpoint:
     """Test suite for GET /v1/congestion/area endpoint."""
 
-    def test_congestion_area_radius_0(self, client, mock_redis):
+    def test_congestion_area_radius_0(self, client, mock_redis, mock_empty_baseline):
         """Test area congestion with radius=0 (single cell)."""
         mock_redis.scard.return_value = 5
+        mock_redis.lrange.return_value = []
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=0")
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=0")
 
         assert response.status_code == 200
         data = response.json()
@@ -294,7 +330,7 @@ class TestCongestionAreaEndpoint:
         assert data["area_congestion_level"] == "LOW"
         assert len(data["cells"]) == 1
 
-    def test_congestion_area_radius_1(self, client, mock_redis):
+    def test_congestion_area_radius_1(self, client, mock_redis, mock_empty_baseline):
         """Test area congestion with radius=1 (7 cells)."""
         # Return different counts for different cells
         call_count = [0]
@@ -304,9 +340,11 @@ class TestCongestionAreaEndpoint:
             return call_count[0] * 2  # Return 2, 4, 6, 8, ...
 
         mock_redis.scard.side_effect = mock_scard
+        mock_redis.lrange.return_value = []
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=1")
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=1")
 
         assert response.status_code == 200
         data = response.json()
@@ -316,31 +354,35 @@ class TestCongestionAreaEndpoint:
         assert data["total_vehicles"] > 0
         assert "avg_vehicles_per_cell" in data
 
-    def test_congestion_area_default_radius(self, client, mock_redis):
+    def test_congestion_area_default_radius(self, client, mock_redis, mock_empty_baseline):
         """Test area congestion with default radius (should be 1)."""
         mock_redis.scard.return_value = 5
+        mock_redis.lrange.return_value = []
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060")
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060")
 
         assert response.status_code == 200
         data = response.json()
         assert data["radius"] == 1
         assert data["total_cells"] == 7
 
-    def test_congestion_area_high_congestion(self, client, mock_redis):
+    def test_congestion_area_high_congestion(self, client, mock_redis, mock_empty_baseline):
         """Test area congestion with high traffic."""
         mock_redis.scard.return_value = 40  # High count for all cells
+        mock_redis.lrange.return_value = []
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=1")
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=1")
 
         assert response.status_code == 200
         data = response.json()
         assert data["area_congestion_level"] == "HIGH"
         assert data["high_congestion_cells"] == 7
 
-    def test_congestion_area_cells_sorted(self, client, mock_redis):
+    def test_congestion_area_cells_sorted(self, client, mock_redis, mock_empty_baseline):
         """Test that cells are sorted by count (highest first)."""
         counts = [5, 35, 10, 25, 8, 15, 20]
         call_index = [0]
@@ -351,9 +393,11 @@ class TestCongestionAreaEndpoint:
             return result
 
         mock_redis.scard.side_effect = mock_scard
+        mock_redis.lrange.return_value = []
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=1")
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=1")
 
         assert response.status_code == 200
         data = response.json()
@@ -363,12 +407,14 @@ class TestCongestionAreaEndpoint:
         for i in range(len(cells) - 1):
             assert cells[i]["count"] >= cells[i + 1]["count"]
 
-    def test_congestion_area_center_cell_marked(self, client, mock_redis):
+    def test_congestion_area_center_cell_marked(self, client, mock_redis, mock_empty_baseline):
         """Test that center cell is marked with is_center=True."""
         mock_redis.scard.return_value = 5
+        mock_redis.lrange.return_value = []
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=1")
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=1")
 
         assert response.status_code == 200
         data = response.json()
@@ -379,12 +425,14 @@ class TestCongestionAreaEndpoint:
         assert len(center_cells) == 1
         assert center_cells[0]["cell_id"] == data["center_cell"]
 
-    def test_congestion_area_invalid_radius(self, client, mock_redis):
+    def test_congestion_area_invalid_radius(self, client, mock_redis, mock_empty_baseline):
         """Test area congestion with invalid radius."""
         mock_redis.scard.return_value = 5
+        mock_redis.lrange.return_value = []
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=invalid")
+            with mock_empty_baseline:
+                response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=invalid")
 
         assert response.status_code == 422
 

@@ -4,6 +4,11 @@ Load Testing Script for Congestion Monitor API
 
 Tests concurrent request handling and measures performance metrics.
 Simulates realistic traffic patterns with multiple devices sending location pings.
+
+Now includes speed data for historical baseline calibration:
+- Normal traffic: 40-70 km/h
+- Moderate congestion: 20-40 km/h
+- Heavy congestion: 5-20 km/h
 """
 import asyncio
 import time
@@ -31,6 +36,13 @@ except ImportError:
 NYC_CENTER = (40.7128, -74.0060)
 NYC_RADIUS = 0.05  # ~5km radius
 
+# Speed ranges for realistic traffic simulation (km/h)
+SPEED_RANGES = {
+    "free_flow": (50, 70),      # Light traffic, moving freely
+    "moderate": (25, 45),       # Some slowdown
+    "congested": (5, 20),       # Heavy traffic, crawling
+}
+
 
 def generate_random_location() -> tuple[float, float]:
     """Generate random coordinates within NYC area."""
@@ -40,6 +52,31 @@ def generate_random_location() -> tuple[float, float]:
         NYC_CENTER[0] + lat_offset,
         NYC_CENTER[1] + lon_offset
     )
+
+
+def generate_random_speed(congestion_mode: str = "mixed") -> float:
+    """
+    Generate realistic speed based on traffic conditions.
+
+    Args:
+        congestion_mode: "free_flow", "moderate", "congested", or "mixed"
+
+    Returns:
+        Speed in km/h
+    """
+    if congestion_mode == "mixed":
+        # Weighted random: 60% free flow, 30% moderate, 10% congested
+        roll = random.random()
+        if roll < 0.6:
+            speed_range = SPEED_RANGES["free_flow"]
+        elif roll < 0.9:
+            speed_range = SPEED_RANGES["moderate"]
+        else:
+            speed_range = SPEED_RANGES["congested"]
+    else:
+        speed_range = SPEED_RANGES.get(congestion_mode, SPEED_RANGES["moderate"])
+
+    return round(random.uniform(*speed_range), 1)
 
 
 def generate_device_id(device_num: int) -> str:
@@ -52,15 +89,29 @@ async def send_ping(
     base_url: str,
     device_id: str,
     lat: float,
-    lon: float
+    lon: float,
+    speed_kmh: float = None,
+    congestion_mode: str = "mixed"
 ) -> Dict[str, Any]:
     """
     Send a single ping request and measure response time.
+
+    Args:
+        client: HTTP client
+        base_url: API base URL
+        device_id: Device identifier
+        lat, lon: GPS coordinates
+        speed_kmh: Speed in km/h (if None, generates random speed)
+        congestion_mode: Traffic mode for speed generation
 
     Returns:
         dict with status, duration, and response data
     """
     start_time = time.perf_counter()
+
+    # Generate speed if not provided
+    if speed_kmh is None:
+        speed_kmh = generate_random_speed(congestion_mode)
 
     try:
         response = await client.post(
@@ -69,6 +120,7 @@ async def send_ping(
                 "device_id": device_id,
                 "lat": lat,
                 "lon": lon,
+                "speed_kmh": speed_kmh,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             },
             timeout=10.0
@@ -80,6 +132,7 @@ async def send_ping(
             "success": response.status_code == 200,
             "status_code": response.status_code,
             "duration": duration,
+            "speed_sent": speed_kmh,
             "response": response.json() if response.status_code == 200 else None,
             "error": None
         }
@@ -90,6 +143,7 @@ async def send_ping(
             "success": False,
             "status_code": 0,
             "duration": duration,
+            "speed_sent": speed_kmh,
             "response": None,
             "error": str(e)
         }
@@ -142,7 +196,8 @@ async def run_load_test(
     num_requests: int,
     num_devices: int,
     concurrent_limit: int,
-    include_queries: bool = False
+    include_queries: bool = False,
+    congestion_mode: str = "mixed"
 ) -> Dict[str, Any]:
     """
     Run load test with specified parameters.
@@ -153,6 +208,7 @@ async def run_load_test(
         num_devices: Number of unique devices
         concurrent_limit: Maximum concurrent requests
         include_queries: Whether to include congestion queries
+        congestion_mode: Traffic simulation mode (free_flow, moderate, congested, mixed)
 
     Returns:
         dict with test results and metrics
@@ -179,11 +235,14 @@ async def run_load_test(
             async with semaphore:
                 device_id = generate_device_id(device_num % num_devices)
                 lat, lon = generate_random_location()
-                result = await send_ping(client, base_url, device_id, lat, lon)
+                result = await send_ping(
+                    client, base_url, device_id, lat, lon,
+                    congestion_mode=congestion_mode
+                )
                 return result
 
         # Send ping requests
-        print(f"Sending {num_requests} pings...")
+        print(f"Sending {num_requests} pings (mode: {congestion_mode})...")
         tasks = [limited_send_ping(i) for i in range(num_requests)]
 
         completed = 0
@@ -231,6 +290,9 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
     ping_failures = [r for r in ping_results if not r["success"]]
     ping_durations = [r["duration"] for r in ping_successes]
 
+    # Speed data from pings
+    speeds_sent = [r.get("speed_sent") for r in ping_successes if r.get("speed_sent")]
+
     # Query metrics (if any)
     query_successes = [r for r in query_results if r["success"]]
     query_failures = [r for r in query_results if not r["success"]]
@@ -251,6 +313,12 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
                 "median": statistics.median(ping_durations) * 1000 if ping_durations else 0,
                 "p95": statistics.quantiles(ping_durations, n=20)[18] * 1000 if len(ping_durations) > 20 else 0,
                 "p99": statistics.quantiles(ping_durations, n=100)[98] * 1000 if len(ping_durations) > 100 else 0,
+            },
+            "speed_data": {
+                "pings_with_speed": len(speeds_sent),
+                "avg_speed_kmh": round(statistics.mean(speeds_sent), 1) if speeds_sent else 0,
+                "min_speed_kmh": round(min(speeds_sent), 1) if speeds_sent else 0,
+                "max_speed_kmh": round(max(speeds_sent), 1) if speeds_sent else 0,
             }
         }
     }
@@ -285,6 +353,7 @@ def display_results(metrics: Dict[str, Any], config: Dict[str, Any]):
     print(f"  Total Requests:   {config['num_requests']}")
     print(f"  Unique Devices:   {config['num_devices']}")
     print(f"  Concurrent Limit: {config['concurrent_limit']}")
+    print(f"  Traffic Mode:     {config.get('congestion_mode', 'mixed')}")
     print(f"  Total Duration:   {metrics['total_duration']:.2f}s")
     print()
 
@@ -307,6 +376,15 @@ def display_results(metrics: Dict[str, Any], config: Dict[str, Any]):
     print(f"  P99:    {latency['p99']:.2f} ms")
     print(f"  Max:    {latency['max']:.2f} ms")
     print()
+
+    # Speed data (for baseline calibration)
+    speed_data = ping_metrics.get("speed_data", {})
+    if speed_data.get("pings_with_speed", 0) > 0:
+        print("Speed Data Sent:")
+        print(f"  Pings with speed: {speed_data['pings_with_speed']}")
+        print(f"  Avg speed:  {speed_data['avg_speed_kmh']:.1f} km/h")
+        print(f"  Range:      {speed_data['min_speed_kmh']:.1f} - {speed_data['max_speed_kmh']:.1f} km/h")
+        print()
 
     # Query metrics (if available)
     if "query_metrics" in metrics:
@@ -380,9 +458,20 @@ async def main():
         help="Include congestion query requests"
     )
     parser.add_argument(
+        "--traffic",
+        choices=["mixed", "free_flow", "moderate", "congested"],
+        default="mixed",
+        help="Traffic simulation mode (default: mixed)"
+    )
+    parser.add_argument(
         "--output",
         default="load_test_results.json",
         help="Output file for results (default: load_test_results.json)"
+    )
+    parser.add_argument(
+        "--save-baselines",
+        action="store_true",
+        help="Save baseline data to database after test (triggers /v1/baseline/update for each cell)"
     )
 
     args = parser.parse_args()
@@ -392,7 +481,8 @@ async def main():
         "num_requests": args.requests,
         "num_devices": args.devices,
         "concurrent_limit": args.concurrent,
-        "include_queries": args.with_queries
+        "include_queries": args.with_queries,
+        "congestion_mode": args.traffic
     }
 
     print("\n" + "="*60)
@@ -419,7 +509,8 @@ async def main():
         args.requests,
         args.devices,
         args.concurrent,
-        args.with_queries
+        args.with_queries,
+        args.traffic
     )
 
     # Calculate and display metrics
@@ -429,9 +520,64 @@ async def main():
     # Save results
     save_results(metrics, config, args.output)
 
+    # Save baselines to database if requested
+    if args.save_baselines:
+        await save_baselines_to_db(args.url, results)
+
     # Show event stream stats if Redis is available
     if REDIS_AVAILABLE:
         print_stream_stats()
+
+
+async def save_baselines_to_db(base_url: str, results: Dict[str, Any]):
+    """
+    Save baseline data to Supabase by triggering /v1/baseline/update for each cell.
+
+    This extracts unique cell IDs from successful ping responses and triggers
+    a baseline update for each, which saves the Redis data to Supabase.
+    """
+    # Collect unique cell IDs from successful pings
+    cell_ids = set()
+    for result in results["ping_results"]:
+        if result["success"] and result.get("response"):
+            cell_id = result["response"].get("cell_id")
+            if cell_id:
+                cell_ids.add(cell_id)
+
+    if not cell_ids:
+        print("\nNo cell IDs found in responses - skipping baseline save")
+        return
+
+    print(f"\nSaving baselines to database for {len(cell_ids)} cells...")
+
+    async with httpx.AsyncClient() as client:
+        success_count = 0
+        error_count = 0
+        first_error = None
+
+        for cell_id in cell_ids:
+            try:
+                response = await client.post(
+                    f"{base_url}/v1/baseline/update",
+                    params={"cell_id": cell_id},
+                    timeout=10.0
+                )
+                if response.status_code == 200:
+                    success_count += 1
+                else:
+                    error_count += 1
+                    if first_error is None:
+                        first_error = f"HTTP {response.status_code}"
+            except Exception as e:
+                error_count += 1
+                if first_error is None:
+                    first_error = str(e)
+
+        print(f"  Saved {success_count}/{len(cell_ids)} baselines to database")
+        if error_count > 0 and first_error:
+            print(f"  WARNING: {error_count} failed - first error: {first_error}")
+            print("  TIP: Make sure DATABASE_URL is set in .env file for Supabase")
+        print()
 
 
 def print_stream_stats():

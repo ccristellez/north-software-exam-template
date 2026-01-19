@@ -19,7 +19,9 @@ Devices send location pings. The service tracks unique devices per geographic ce
 - **Redis Sets** track unique devices per cell+bucket (auto-deduplicated)
 - **Redis Streams** for event-driven processing (alerts, analytics)
 - **TTL-based expiration** - keys expire after 5 minutes, no cleanup needed
-- **Congestion thresholds**: LOW (0-9), MODERATE (10-29), HIGH (30+)
+- **Speed-based congestion detection** using Z-scores against historical baselines
+- **Supabase PostgreSQL** stores historical baselines (avg speed, avg count, variance)
+- **Self-calibrating system** - each cell learns what "normal" looks like over time
 
 ## Quick Start
 
@@ -32,6 +34,10 @@ py -3.12 -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
 
+# Configure database (optional - for historical baselines)
+# Create .env file with Supabase connection pooler URL:
+# DATABASE_URL=postgresql://user:pass@your-project.pooler.supabase.com:6543/postgres
+
 # Run API
 uvicorn src.api.main:app --reload
 
@@ -42,16 +48,19 @@ curl http://127.0.0.1:8000/health
 ## API
 
 ```bash
-# Send ping
+# Send ping with speed data
 curl -X POST http://127.0.0.1:8000/v1/pings \
   -H "Content-Type: application/json" \
-  -d '{"device_id":"car1","lat":40.743,"lon":-73.989}'
+  -d '{"device_id":"car1","lat":40.743,"lon":-73.989,"speed_kmh":45.5}'
 
-# Query congestion
+# Query congestion (returns Z-score based level)
 curl "http://127.0.0.1:8000/v1/congestion?lat=40.743&lon=-73.989"
 
 # Query area (7 hexagons)
 curl "http://127.0.0.1:8000/v1/congestion/area?lat=40.743&lon=-73.989&radius=1"
+
+# Update baseline for a cell (triggers historical learning)
+curl -X POST "http://127.0.0.1:8000/v1/baseline/update?lat=40.743&lon=-73.989"
 ```
 
 Docs: http://127.0.0.1:8000/docs
@@ -62,8 +71,11 @@ Docs: http://127.0.0.1:8000/docs
 # Unit tests
 pytest -v
 
-# Load test
-python scripts/load_test.py
+# Load test with traffic simulation
+python scripts/load_test.py --requests 500 --traffic moderate
+
+# Load test and save baselines to database
+python scripts/load_test.py --requests 500 --traffic moderate --save-baselines
 ```
 
 ## Event-Driven Demo
@@ -103,12 +115,32 @@ congestion-monitor/
 │   ├── time_utils.py     # Time bucketing
 │   ├── models.py         # Pydantic models
 │   ├── metrics.py        # Prometheus metrics
-│   └── events.py         # Redis Stream event publishing
+│   ├── events.py         # Redis Stream event publishing
+│   ├── congestion.py     # Z-score based congestion detection
+│   └── database.py       # Supabase PostgreSQL connection
 ├── tests/                # Unit tests
 ├── scripts/
-│   ├── load_test.py      # Load testing
+│   ├── load_test.py      # Load testing with speed simulation
 │   ├── event_consumer.py # Event stream consumer
-│   └── demo_congestion.py # Demo script for HIGH congestion
+│   └── demo_congestion.py # Demo script for congestion
 ├── docs/                 # Architecture & design docs
 └── terraform/            # AWS infrastructure (not deployed)
 ```
+
+## Database Setup (Supabase)
+
+The system uses Supabase PostgreSQL to store historical baselines. Create the table:
+
+```sql
+CREATE TABLE hex_baselines (
+    cell_id VARCHAR(20) PRIMARY KEY,
+    avg_speed FLOAT DEFAULT 0,
+    avg_count FLOAT DEFAULT 0,
+    speed_variance FLOAT DEFAULT 0,
+    count_variance FLOAT DEFAULT 0,
+    sample_count INT DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Note:** Use the Supabase connection **pooler** URL (port 6543) in your `.env` file for IPv4 compatibility.

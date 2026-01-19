@@ -7,3 +7,4 @@ class Ping(BaseModel):
     timestamp: Optional[datetime] = Field(default=None)
     lat: float
     lon: float
+    speed_kmh: Optional[float] = Field(default=None, ge=0, description="Speed in km/h from GPS")

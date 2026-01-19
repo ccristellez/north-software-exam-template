@@ -14,6 +14,7 @@ from src.api.time_utils import current_bucket, WINDOW_SECONDS
 from src.api.grid import latlon_to_cell, get_neighbor_cells
 from src.api import metrics
 from src.api import events
+from src.api import congestion as cong
 
 # Initialize FastAPI application
 app = FastAPI(
@@ -98,6 +99,11 @@ def create_ping(ping: Ping):
     # Set expiration to 300 seconds (5 minutes) to auto-clean old data
     r.expire(key, 300)
 
+    # Store speed data if provided (for historical baseline calibration)
+    if ping.speed_kmh is not None:
+        cong.record_speed(r, cell_id, bucket, ping.speed_kmh)
+        metrics.redis_operations_total.labels(operation="rpush", status="success").inc()
+
     # Record metrics
     metrics.ping_requests_total.labels(status="success").inc()
     metrics.unique_devices_per_bucket.labels(cell_id=cell_id).set(count)
@@ -148,21 +154,28 @@ def ping_count():
 
 
 @app.get("/v1/congestion")
-def congestion(lat: float, lon: float):
+def congestion(lat: float, lon: float, debug: bool = False):
     """
     Get congestion level for a single hexagon cell.
 
+    Uses historical baseline calibration with Z-scores when available.
+    Each cell learns its own "normal" traffic patterns over time, allowing
+    the system to detect congestion relative to what's typical for that
+    specific location.
+
     Process:
     1. Convert lat/lon to H3 cell ID
-    2. Look up vehicle count in current time bucket
-    3. Classify congestion level based on thresholds
+    2. Look up vehicle count and speeds in current time bucket
+    3. Retrieve historical baseline for this cell
+    4. Calculate congestion using Z-scores (or fallback to absolute thresholds)
 
     Args:
         lat: Latitude
         lon: Longitude
+        debug: If True, include calculation details in response
 
     Returns:
-        dict: Cell ID, vehicle count, and congestion level (LOW/MODERATE/HIGH)
+        dict: Cell ID, vehicle count, avg speed, and congestion level (LOW/MODERATE/HIGH)
     """
     start_time = time.time()
     r = get_redis_client()
@@ -172,32 +185,41 @@ def congestion(lat: float, lon: float):
 
     # Get current time bucket
     now = datetime.now(timezone.utc)
-    current = int(now.timestamp()) // WINDOW_SECONDS
+    bucket = int(now.timestamp()) // WINDOW_SECONDS
 
     # Query Redis for unique device count in this cell during current bucket
-    key = f"cell:{cell_id}:bucket:{current}"
+    key = f"cell:{cell_id}:bucket:{bucket}"
     count = int(r.scard(key) or 0)
     metrics.redis_operations_total.labels(operation="scard", status="success").inc()
 
-    # Classify congestion based on vehicle count thresholds
-    if count >= 30:
-        level = "HIGH"
-    elif count >= 10:
-        level = "MODERATE"
-    else:
-        level = "LOW"
+    # Get speeds for this bucket
+    speeds = cong.get_bucket_speeds(r, cell_id, bucket)
+    avg_speed = sum(speeds) / len(speeds) if speeds else None
+
+    # Get historical baseline for this cell (from Supabase)
+    baseline = cong.get_baseline(cell_id)
+
+    # Calculate congestion level using Z-scores
+    level, debug_info = cong.calculate_congestion_level(count, avg_speed, baseline)
 
     # Record metrics
     metrics.congestion_requests_total.labels(endpoint="congestion", status="success").inc()
     metrics.congestion_level_count.labels(level=level).inc()
     metrics.request_duration_seconds.labels(endpoint="congestion").observe(time.time() - start_time)
 
-    return {
+    response = {
         "cell_id": cell_id,
         "vehicle_count": count,
+        "avg_speed_kmh": round(avg_speed, 1) if avg_speed else None,
         "congestion_level": level,
+        "calibrated": baseline.is_calibrated,
         "window_seconds": WINDOW_SECONDS,
     }
+
+    if debug:
+        response["debug"] = debug_info
+
+    return response
 
 
 @app.get("/v1/congestion/area")
@@ -206,12 +228,13 @@ def congestion_area(lat: float, lon: float, radius: int = 1):
     Get congestion for a hexagonal area around the given location.
 
     Uses H3's grid_disk (k-ring) algorithm to find all hexagons within
-    a specified number of hops from the center point.
+    a specified number of hops from the center point. Each cell uses
+    historical baseline calibration when available.
 
     Process:
     1. Convert lat/lon to center H3 cell
     2. Get all neighboring cells within 'radius' hops
-    3. Query congestion for each cell in parallel
+    3. Query congestion for each cell using Z-score calibration
     4. Aggregate results and calculate area-level metrics
 
     Args:
@@ -227,6 +250,7 @@ def congestion_area(lat: float, lon: float, radius: int = 1):
             - area_congestion_level: Overall congestion (LOW/MODERATE/HIGH)
             - total_vehicles: Sum of all vehicles in the area
             - avg_vehicles_per_cell: Average count across all cells
+            - avg_speed_kmh: Average speed across all cells with speed data
             - high_congestion_cells: Count of cells with HIGH congestion
             - cells: List of individual cell data, sorted by count
 
@@ -248,26 +272,29 @@ def congestion_area(lat: float, lon: float, radius: int = 1):
 
     # Get current time bucket
     now = datetime.now(timezone.utc)
-    current = int(now.timestamp()) // WINDOW_SECONDS
+    bucket = int(now.timestamp()) // WINDOW_SECONDS
 
     # Query congestion for all cells in the area
     cell_data = []
     total_count = 0
+    all_speeds = []
 
     for cell_id in area_cells:
         # Build Redis key for this cell + bucket
-        key = f"cell:{cell_id}:bucket:{current}"
+        key = f"cell:{cell_id}:bucket:{bucket}"
         count = int(r.scard(key) or 0)
         metrics.redis_operations_total.labels(operation="scard", status="success").inc()
         total_count += count
 
-        # Classify this cell's congestion level
-        if count >= 30:
-            level = "HIGH"
-        elif count >= 10:
-            level = "MODERATE"
-        else:
-            level = "LOW"
+        # Get speeds for this cell
+        speeds = cong.get_bucket_speeds(r, cell_id, bucket)
+        avg_speed = sum(speeds) / len(speeds) if speeds else None
+        if speeds:
+            all_speeds.extend(speeds)
+
+        # Get baseline and calculate congestion level (baseline from Supabase)
+        baseline = cong.get_baseline(cell_id)
+        level, _ = cong.calculate_congestion_level(count, avg_speed, baseline)
 
         metrics.congestion_level_count.labels(level=level).inc()
 
@@ -275,7 +302,9 @@ def congestion_area(lat: float, lon: float, radius: int = 1):
         cell_data.append({
             "cell_id": cell_id,
             "count": count,
+            "avg_speed_kmh": round(avg_speed, 1) if avg_speed else None,
             "level": level,
+            "calibrated": baseline.is_calibrated,
             "is_center": cell_id == center_cell_id
         })
 
@@ -284,6 +313,7 @@ def congestion_area(lat: float, lon: float, radius: int = 1):
 
     # Calculate area-level metrics
     avg_count = total_count / len(area_cells) if area_cells else 0
+    area_avg_speed = sum(all_speeds) / len(all_speeds) if all_speeds else None
     high_congestion_cells = sum(1 for c in cell_data if c["level"] == "HIGH")
 
     # Determine overall area congestion level
@@ -308,7 +338,93 @@ def congestion_area(lat: float, lon: float, radius: int = 1):
         "area_congestion_level": area_level,
         "total_vehicles": total_count,
         "avg_vehicles_per_cell": round(avg_count, 1),
+        "avg_speed_kmh": round(area_avg_speed, 1) if area_avg_speed else None,
         "high_congestion_cells": high_congestion_cells,
         "cells": cell_data,
         "window_seconds": WINDOW_SECONDS
+    }
+
+
+@app.get("/v1/baseline")
+def get_cell_baseline(lat: float, lon: float):
+    """
+    Get historical baseline data for a cell.
+
+    Returns the learned traffic patterns for the hexagon at the given location,
+    including average speed, average count, and their standard deviations.
+    This data is stored in Supabase and persists across server restarts.
+
+    Args:
+        lat: Latitude
+        lon: Longitude
+
+    Returns:
+        dict: Baseline statistics for this cell
+    """
+    cell_id = latlon_to_cell(lat, lon)
+    baseline = cong.get_baseline(cell_id)
+
+    return {
+        "cell_id": cell_id,
+        "avg_speed_kmh": round(baseline.avg_speed, 1) if baseline.avg_speed else None,
+        "avg_count": round(baseline.avg_count, 1),
+        "speed_std": round(baseline.speed_std, 2),
+        "count_std": round(baseline.count_std, 2),
+        "sample_count": baseline.sample_count,
+        "is_calibrated": baseline.is_calibrated,
+        "min_samples_required": cong.MIN_SAMPLES_FOR_CALIBRATION
+    }
+
+
+@app.post("/v1/baseline/update")
+def update_cell_baseline(lat: float = None, lon: float = None, cell_id: str = None):
+    """
+    Manually trigger baseline update for a cell using current bucket data.
+
+    This endpoint is useful for demos and testing. In production, baseline
+    updates would typically happen via a background job when buckets expire.
+    The baseline is saved to Supabase for persistence.
+
+    Args:
+        lat: Latitude (optional if cell_id provided)
+        lon: Longitude (optional if cell_id provided)
+        cell_id: H3 cell ID (optional if lat/lon provided)
+
+    Returns:
+        dict: Updated baseline statistics
+    """
+    r = get_redis_client()
+
+    # Get cell_id from lat/lon if not provided directly
+    if cell_id is None:
+        if lat is None or lon is None:
+            return {"error": "Must provide either cell_id or lat/lon"}
+        cell_id = latlon_to_cell(lat, lon)
+
+    # Get current bucket data from Redis
+    now = datetime.now(timezone.utc)
+    bucket = int(now.timestamp()) // WINDOW_SECONDS
+
+    key = f"cell:{cell_id}:bucket:{bucket}"
+    count = int(r.scard(key) or 0)
+
+    speeds = cong.get_bucket_speeds(r, cell_id, bucket)
+    avg_speed = sum(speeds) / len(speeds) if speeds else None
+
+    # Update baseline (saves to Supabase)
+    baseline = cong.update_baseline_with_bucket(cell_id, count, avg_speed)
+
+    return {
+        "message": "Baseline updated",
+        "cell_id": cell_id,
+        "bucket_count": count,
+        "bucket_avg_speed": round(avg_speed, 1) if avg_speed else None,
+        "new_baseline": {
+            "avg_speed_kmh": round(baseline.avg_speed, 1) if baseline.avg_speed else None,
+            "avg_count": round(baseline.avg_count, 1),
+            "speed_std": round(baseline.speed_std, 2),
+            "count_std": round(baseline.count_std, 2),
+            "sample_count": baseline.sample_count,
+            "is_calibrated": baseline.is_calibrated
+        }
     }
