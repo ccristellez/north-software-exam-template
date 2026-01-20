@@ -95,7 +95,7 @@ python tests/load_test.py --populate --days 7 --cells 10
 python tests/load_test.py --load --users 50 --requests 20
 ```
 
-## Interview Demo Guide
+## Demo Guide
 
 This section shows how to demonstrate the system's features. You'll need **4 terminal windows**.
 
@@ -160,7 +160,7 @@ Show the interactive API docs.
 http://127.0.0.1:8000/docs
 ```
 
-### What to Highlight in Interview
+### Key Features to Highlight
 
 | Feature | How to Show | Terminal |
 |---------|-------------|----------|

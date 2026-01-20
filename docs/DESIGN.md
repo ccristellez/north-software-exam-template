@@ -173,7 +173,7 @@ Count-based:
 - Self-calibrating (highway vs. residential adapts automatically)
 - More robust to outliers than mean/std deviation
 - Simple SQL queries (PERCENTILE_CONT) instead of complex algorithms
-- Easy to explain in interviews
+- Easy to explain and understand
 
 **Trade-offs accepted:**
 - Requires time to build history (20 samples minimum)

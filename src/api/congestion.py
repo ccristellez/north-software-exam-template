@@ -10,7 +10,7 @@ to historical percentiles. The approach:
 
 Why percentiles instead of Z-scores?
 - Easier to understand: "below 25th percentile" vs "1.5 standard deviations"
-- Easier to explain in interviews
+- Easier to explain and understand
 - More robust to outliers than mean/std
 - Simple SQL queries instead of Welford's algorithm
 """

@@ -405,4 +405,4 @@ After 20 samples (defined by `MIN_SAMPLES_FOR_PERCENTILES` in `congestion.py:26`
 
 **Redis TTL:** Old data disappears automatically. No cleanup scripts needed.
 
-The system is simple enough to explain in an interview, but robust enough for production traffic.
+The system is simple enough to understand quickly, but robust enough for production traffic.
