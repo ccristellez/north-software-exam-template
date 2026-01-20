@@ -61,6 +61,7 @@
 
 ### 1. Ping Ingestion Flow
 
+```
 ┌────────┐    POST /v1/pings     ┌─────────┐    SADD      ┌───────┐
 │ Device │ ──────────────────────▶│ FastAPI │─────────────▶│ Redis │
 │        │ {device_id,lat,lon,   │         │   + RPUSH    │       │
@@ -85,10 +86,12 @@
                               │ cell:882a100d63fffff:bucket:N │
                               │ Redis Value: SET{device_ids}  │
                               └───────────────────────────────┘
+```
 
 
 ### 2. Congestion Query Flow (Percentile-Based)
 
+```
 ┌────────┐   GET /v1/congestion   ┌─────────┐
 │ Client │ ──────────────────────▶│ FastAPI │
 │        │    ?lat=X&lon=Y        │         │
@@ -109,10 +112,12 @@
                                │ < p50   → MOD  │
                                │ >= p50  → LOW  │
                                └────────────────┘
+```
 
 
 ### 3. Area Query Flow (k-ring)
 
+```
 ┌────────┐  GET /v1/congestion/area  ┌─────────┐
 │ Client │ ─────────────────────────▶│ FastAPI │
 │        │   ?lat=X&lon=Y&radius=2   │         │
@@ -133,6 +138,7 @@
                                   │ • avg/cell    │
                                   │ • area level  │
                                   └───────────────┘
+```
 
 
 ### 4. History Save Flow
@@ -183,7 +189,7 @@ separate background job. This is implemented as "update-on-write":
 3. Mark bucket N-1 as saved (using a Redis flag with TTL)
 4. Process the new ping normally
 
-See the **Design Tradeoffs** section at the end of this document for rationale.
+See [DESIGN.md](./DESIGN.md) for rationale on the update-on-write pattern.
 
 
 ### 6. Event-Driven Flow (Redis Streams)
