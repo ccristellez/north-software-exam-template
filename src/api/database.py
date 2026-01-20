@@ -1,24 +1,20 @@
 """
 Database connection for Supabase PostgreSQL.
 
-We use Supabase to store historical baselines because:
-- Baselines are long-lived data that should survive restarts
-- Redis is better for ephemeral real-time data (buckets, speeds)
-- PostgreSQL gives us durability and easy querying
-
-The connection URL is loaded from .env file (not committed to git).
+We use Supabase to store bucket history because:
+- Historical data should survive restarts
+- Redis is better for ephemeral real-time data (current bucket counts/speeds)
+- PostgreSQL gives us durability and powerful percentile queries
 """
-import os
 from datetime import datetime, timezone
 from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
-from dotenv import load_dotenv
+from sqlalchemy.dialects.postgresql import TIMESTAMP
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Get database URL from environment
-DATABASE_URL = os.getenv("DATABASE_URL")
+# TAKE-HOME ONLY: Hardcoded for simplicity. In production, this would be loaded
+# from environment variables or a secrets manager (AWS Secrets Manager, HashiCorp
+# Vault, etc.) and never committed to source control.
+DATABASE_URL = "postgresql://postgres.uoqpvedhocxtduspgcrn:FflaWsf8Znh0tTwH@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
 
 # Create engine and session factory
 # We only create these if DATABASE_URL is set (allows tests to run without DB)
@@ -33,25 +29,28 @@ if DATABASE_URL:
 Base = declarative_base()
 
 
-class HexBaseline(Base):
+class BucketHistory(Base):
     """
-    Stores historical traffic baselines for each hexagon cell.
+    Stores completed 5-minute bucket data for percentile-based congestion detection.
 
-    Each cell learns what "normal" looks like over time:
-    - avg_speed: typical speed in this cell
-    - avg_count: typical vehicle count
-    - variance values let us calculate standard deviation for Z-scores
-    - sample_count tracks how much data we have
+    Instead of computing running statistics (mean/variance), we store raw bucket data
+    and use SQL percentile queries. This approach is:
+    - Easier to understand and explain
+    - Debuggable (can see exact historical data)
+    - Supports time-of-day filtering (rush hour vs. midnight)
+
+    See docs/schema.sql for full DDL and example queries.
     """
-    __tablename__ = "hex_baselines"
+    __tablename__ = "bucket_history"
 
-    cell_id = Column(String(20), primary_key=True)
-    avg_speed = Column(Float, default=0)
-    avg_count = Column(Float, default=0)
-    speed_variance = Column(Float, default=0)
-    count_variance = Column(Float, default=0)
-    sample_count = Column(Integer, default=0)
-    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cell_id = Column(String(20), nullable=False)
+    bucket_time = Column(DateTime(timezone=True), nullable=False)
+    vehicle_count = Column(Integer, nullable=False)
+    avg_speed = Column(Float, nullable=True)  # NULL if no speed data
+    hour_of_day = Column(Integer, nullable=False)  # 0-23
+    day_of_week = Column(Integer, nullable=False)  # 0=Monday, 6=Sunday
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 def get_db_session():

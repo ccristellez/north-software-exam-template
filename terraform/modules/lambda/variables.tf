@@ -98,3 +98,10 @@ variable "sns_topic_arn" {
   type        = string
   default     = null
 }
+
+variable "database_url" {
+  description = "PostgreSQL connection URL for Supabase (for historical data)"
+  type        = string
+  default     = ""
+  sensitive   = true
+}

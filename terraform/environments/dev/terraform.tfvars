@@ -27,3 +27,9 @@ redis_num_cache_clusters = 1                 # No replication
 # Alerts - Disabled for dev
 enable_alerts = false
 alert_email   = ""
+
+# Database - Supabase PostgreSQL (for historical percentile data)
+# Get this from Supabase dashboard: Project Settings > Database > Connection string (URI)
+# Use the "connection pooler" URL with port 6543 for IPv4 compatibility
+# database_url = "postgresql://user:pass@your-project.pooler.supabase.com:6543/postgres"
+database_url = ""  # Leave empty if not using historical data

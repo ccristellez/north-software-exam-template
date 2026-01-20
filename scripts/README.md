@@ -2,58 +2,13 @@
 
 Utility scripts for testing and demoing the Congestion Monitor API.
 
-## Load Testing
-
-`load_test.py` - Async load testing with performance metrics and speed data.
-
-### Usage
-
-```bash
-# Default: 1000 requests, 50 concurrent, mixed traffic speeds
-python scripts/load_test.py
-
-# Custom configuration
-python scripts/load_test.py --requests 5000 --devices 200 --concurrent 100
-
-# Different traffic modes
-python scripts/load_test.py --traffic free_flow    # 50-70 km/h
-python scripts/load_test.py --traffic moderate     # 25-45 km/h
-python scripts/load_test.py --traffic congested    # 5-20 km/h
-python scripts/load_test.py --traffic mixed        # Weighted mix (default)
-
-# Include congestion queries
-python scripts/load_test.py --with-queries
-
-# Save baseline data to Supabase database after test
-python scripts/load_test.py --requests 500 --traffic moderate --save-baselines
-```
-
-### Options
-
-```
---url            API base URL (default: http://localhost:8000)
---requests       Number of requests (default: 1000)
---devices        Unique devices (default: 100)
---concurrent     Max concurrent requests (default: 50)
---traffic        Traffic mode: mixed, free_flow, moderate, congested (default: mixed)
---with-queries   Include congestion query tests
---save-baselines Save baseline data to database after test
---output         JSON output file (default: load_test_results.json)
-```
-
-### Metrics
-
-- Throughput (req/s)
-- Success rate (%)
-- Latency percentiles (min, mean, median, P95, P99, max)
-- Speed data statistics (avg, min, max)
-- Results exported to JSON
+**Note:** The main load testing script is now in `tests/load_test.py` - see below.
 
 ---
 
 ## Congestion Demo
 
-`demo_congestion.py` - Interactive demo showing speed-based congestion detection.
+`demo_congestion.py` - Interactive demo showing percentile-based congestion detection.
 
 ### Usage
 
@@ -75,9 +30,9 @@ python scripts/demo_congestion.py --count 50
 
 1. Sends pings with speed data to a single location
 2. Displays vehicle count and speed for each ping
-3. Shows final congestion level with Z-score debug info
-4. Displays historical baseline data
-5. Explains how to build up baselines for calibration
+3. Shows final congestion level with percentile comparison
+4. Displays historical percentile data
+5. Explains how the system calibrates over time
 
 ---
 
@@ -105,19 +60,49 @@ Shows:
 
 ---
 
+## Load Testing (Recommended)
+
+The main load testing script is in **`tests/load_test.py`** and supports:
+- Populating historical data directly to database
+- Running concurrent load tests against the API
+- Realistic traffic pattern simulation
+
+### Usage
+
+```bash
+# Populate database with historical data + run load test
+python tests/load_test.py --all
+
+# Just populate historical data (for percentile calibration)
+python tests/load_test.py --populate --days 7 --cells 10
+
+# Just run load test (API must be running)
+python tests/load_test.py --load --users 50 --requests 20
+```
+
+See `tests/load_test.py --help` for all options.
+
+---
+
 ## Quick Start
 
-1. Start the API:
+1. Start Redis and the API:
    ```bash
+   docker-compose up -d
    uvicorn src.api.main:app --reload
    ```
 
-2. Run demo (in another terminal):
+2. (Optional) Populate historical data for percentile calibration:
+   ```bash
+   python tests/load_test.py --populate --days 7 --cells 5
+   ```
+
+3. Run demo (in another terminal):
    ```bash
    python scripts/demo_congestion.py
    ```
 
-3. Run load test and save baselines to database:
+4. Watch events (in a third terminal):
    ```bash
-   python scripts/load_test.py --requests 500 --traffic moderate --save-baselines
+   python scripts/event_consumer.py
    ```

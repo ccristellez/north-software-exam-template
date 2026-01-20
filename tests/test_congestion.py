@@ -1,20 +1,20 @@
 """
 Unit tests for the congestion calculation module.
-Tests Z-score based congestion detection with historical baselines.
+Tests percentile-based congestion detection with historical bucket data.
 
-Note: get_baseline, save_baseline, update_baseline_with_bucket now use Supabase.
+Note: get_cell_percentiles and save_bucket_to_history use Supabase.
 These tests mock the database module to avoid needing a real database connection.
 """
 import pytest
 from unittest.mock import Mock, patch, MagicMock
+from datetime import datetime, timezone
 from src.api.congestion import (
-    CellBaseline,
-    calculate_z_score,
+    CellPercentiles,
     calculate_congestion_level,
-    get_baseline,
-    save_baseline,
-    update_baseline_with_bucket,
-    MIN_SAMPLES_FOR_CALIBRATION,
+    get_cell_percentiles,
+    save_bucket_to_history,
+    _calculate_congestion_fallback,
+    MIN_SAMPLES_FOR_PERCENTILES,
     FALLBACK_SPEED_HIGH,
     FALLBACK_SPEED_MODERATE,
     FALLBACK_COUNT_HIGH,
@@ -23,315 +23,305 @@ from src.api.congestion import (
 
 
 @pytest.mark.unit
-class TestCellBaseline:
-    """Test suite for CellBaseline dataclass."""
+class TestCellPercentiles:
+    """Test suite for CellPercentiles dataclass."""
 
-    def test_baseline_defaults(self):
-        """Test default values for a new baseline."""
-        baseline = CellBaseline()
-        assert baseline.avg_speed == 0.0
-        assert baseline.avg_count == 0.0
-        assert baseline.speed_variance == 0.0
-        assert baseline.count_variance == 0.0
-        assert baseline.sample_count == 0
+    def test_percentiles_defaults(self):
+        """Test default values for empty percentiles."""
+        percentiles = CellPercentiles()
+        assert percentiles.speed_p25 is None
+        assert percentiles.speed_p50 is None
+        assert percentiles.count_p75 is None
+        assert percentiles.sample_count == 0
 
-    def test_baseline_speed_std(self):
-        """Test speed standard deviation calculation."""
-        baseline = CellBaseline(speed_variance=100.0)
-        assert baseline.speed_std == 10.0  # sqrt(100)
+    def test_percentiles_has_speed_data_true(self):
+        """Test has_speed_data returns True when both percentiles exist."""
+        percentiles = CellPercentiles(speed_p25=30.0, speed_p50=45.0)
+        assert percentiles.has_speed_data == True
 
-    def test_baseline_count_std(self):
-        """Test count standard deviation calculation."""
-        baseline = CellBaseline(count_variance=25.0)
-        assert baseline.count_std == 5.0  # sqrt(25)
+    def test_percentiles_has_speed_data_false(self):
+        """Test has_speed_data returns False when percentiles are missing."""
+        percentiles = CellPercentiles(speed_p25=30.0)  # Missing p50
+        assert percentiles.has_speed_data == False
 
-    def test_baseline_std_zero_variance(self):
-        """Test std returns 1.0 when variance is 0 (prevent div by zero)."""
-        baseline = CellBaseline(speed_variance=0.0, count_variance=0.0)
-        assert baseline.speed_std == 1.0
-        assert baseline.count_std == 1.0
-
-    def test_baseline_is_calibrated_true(self):
+    def test_percentiles_is_calibrated_true(self):
         """Test is_calibrated returns True when enough samples."""
-        baseline = CellBaseline(sample_count=MIN_SAMPLES_FOR_CALIBRATION)
-        assert baseline.is_calibrated == True
+        percentiles = CellPercentiles(sample_count=MIN_SAMPLES_FOR_PERCENTILES)
+        assert percentiles.is_calibrated == True
 
-    def test_baseline_is_calibrated_false(self):
+    def test_percentiles_is_calibrated_false(self):
         """Test is_calibrated returns False when not enough samples."""
-        baseline = CellBaseline(sample_count=MIN_SAMPLES_FOR_CALIBRATION - 1)
-        assert baseline.is_calibrated == False
-
-
-@pytest.mark.unit
-class TestZScoreCalculation:
-    """Test suite for Z-score calculation."""
-
-    def test_z_score_at_mean(self):
-        """Test Z-score is 0 when value equals mean."""
-        z = calculate_z_score(value=50, mean=50, std=10)
-        assert z == 0.0
-
-    def test_z_score_above_mean(self):
-        """Test Z-score is positive when value is above mean."""
-        z = calculate_z_score(value=60, mean=50, std=10)
-        assert z == 1.0  # (60-50)/10 = 1
-
-    def test_z_score_below_mean(self):
-        """Test Z-score is negative when value is below mean."""
-        z = calculate_z_score(value=40, mean=50, std=10)
-        assert z == -1.0  # (40-50)/10 = -1
-
-    def test_z_score_inverted(self):
-        """Test inverted Z-score (for speed where lower = worse)."""
-        # Speed: 40 km/h, mean: 60 km/h, std: 10
-        # Without invert: (40-60)/10 = -2
-        # With invert: (60-40)/10 = 2 (positive = worse)
-        z = calculate_z_score(value=40, mean=60, std=10, invert=True)
-        assert z == 2.0
-
-    def test_z_score_zero_std_uses_one(self):
-        """Test that zero std is replaced with 1 to prevent div by zero."""
-        z = calculate_z_score(value=55, mean=50, std=0)
-        assert z == 5.0  # (55-50)/1 = 5
+        percentiles = CellPercentiles(sample_count=MIN_SAMPLES_FOR_PERCENTILES - 1)
+        assert percentiles.is_calibrated == False
 
 
 @pytest.mark.unit
 class TestCongestionLevelFallback:
-    """Test congestion level calculation in fallback mode (no baseline)."""
+    """Test congestion level calculation in fallback mode (no history)."""
 
     def test_fallback_low_count_no_speed(self):
         """Test LOW congestion with low count and no speed data."""
-        baseline = CellBaseline(sample_count=0)
-        level, _ = calculate_congestion_level(5, None, baseline)
+        percentiles = CellPercentiles(sample_count=0)
+        level, _ = calculate_congestion_level(5, None, percentiles)
         assert level == "LOW"
 
     def test_fallback_moderate_count_no_speed(self):
         """Test MODERATE congestion with moderate count and no speed data."""
-        baseline = CellBaseline(sample_count=0)
-        level, _ = calculate_congestion_level(FALLBACK_COUNT_MODERATE, None, baseline)
+        percentiles = CellPercentiles(sample_count=0)
+        level, _ = calculate_congestion_level(FALLBACK_COUNT_MODERATE, None, percentiles)
         assert level == "MODERATE"
 
     def test_fallback_high_count_no_speed(self):
         """Test HIGH congestion with high count and no speed data."""
-        baseline = CellBaseline(sample_count=0)
-        level, _ = calculate_congestion_level(FALLBACK_COUNT_HIGH, None, baseline)
+        percentiles = CellPercentiles(sample_count=0)
+        level, _ = calculate_congestion_level(FALLBACK_COUNT_HIGH, None, percentiles)
         assert level == "HIGH"
 
-    def test_fallback_high_speed_overrides_low_count(self):
+    def test_fallback_high_speed_means_low(self):
         """Test that good speed results in LOW even with low count."""
-        baseline = CellBaseline(sample_count=0)
-        level, _ = calculate_congestion_level(5, 60.0, baseline)  # Good speed
+        percentiles = CellPercentiles(sample_count=0)
+        level, _ = calculate_congestion_level(5, 60.0, percentiles)  # Good speed
         assert level == "LOW"
 
     def test_fallback_low_speed_means_high(self):
         """Test that very low speed means HIGH congestion."""
-        baseline = CellBaseline(sample_count=0)
-        level, _ = calculate_congestion_level(5, 10.0, baseline)  # Very slow
+        percentiles = CellPercentiles(sample_count=0)
+        level, _ = calculate_congestion_level(5, 10.0, percentiles)  # Very slow
         assert level == "HIGH"
 
     def test_fallback_moderate_speed(self):
         """Test MODERATE speed threshold."""
-        baseline = CellBaseline(sample_count=0)
-        level, _ = calculate_congestion_level(5, 30.0, baseline)  # Moderate speed
+        percentiles = CellPercentiles(sample_count=0)
+        level, _ = calculate_congestion_level(5, 30.0, percentiles)  # Moderate speed
         assert level == "MODERATE"
 
     def test_fallback_debug_info_shows_method(self):
         """Test debug info indicates fallback mode."""
-        baseline = CellBaseline(sample_count=10)
-        _, debug = calculate_congestion_level(5, None, baseline)
+        percentiles = CellPercentiles(sample_count=10)
+        _, debug = calculate_congestion_level(5, None, percentiles)
         assert debug["method"] == "fallback"
 
 
 @pytest.mark.unit
 class TestCongestionLevelCalibrated:
-    """Test congestion level calculation in calibrated mode (with baseline)."""
+    """Test congestion level calculation in calibrated mode (with percentiles)."""
 
-    def test_calibrated_normal_conditions(self):
-        """Test LOW when current conditions match baseline."""
-        baseline = CellBaseline(
-            avg_speed=60.0,
-            avg_count=20.0,
-            speed_variance=100.0,  # std=10
-            count_variance=25.0,   # std=5
-            sample_count=MIN_SAMPLES_FOR_CALIBRATION
+    def test_calibrated_low_when_above_median(self):
+        """Test LOW when current speed is above median (p50)."""
+        percentiles = CellPercentiles(
+            speed_p25=30.0,  # 25th percentile
+            speed_p50=45.0,  # median
+            count_p75=25.0,  # 75th percentile count
+            sample_count=MIN_SAMPLES_FOR_PERCENTILES
         )
-        # Current: speed=60 (exactly avg), count=20 (exactly avg)
-        level, debug = calculate_congestion_level(20, 60.0, baseline)
+        # Current speed 50 is above median 45
+        level, debug = calculate_congestion_level(15, 50.0, percentiles)
         assert level == "LOW"
-        assert debug["method"] == "calibrated"
+        assert debug["method"] == "percentile"
 
-    def test_calibrated_high_when_slow_and_crowded(self):
-        """Test HIGH when speed is much lower and count is much higher."""
-        baseline = CellBaseline(
-            avg_speed=60.0,
-            avg_count=20.0,
-            speed_variance=100.0,  # std=10
-            count_variance=25.0,   # std=5
-            sample_count=MIN_SAMPLES_FOR_CALIBRATION
+    def test_calibrated_high_when_below_p25(self):
+        """Test HIGH when current speed is below 25th percentile."""
+        percentiles = CellPercentiles(
+            speed_p25=30.0,
+            speed_p50=45.0,
+            count_p75=25.0,
+            sample_count=MIN_SAMPLES_FOR_PERCENTILES
         )
-        # Current: speed=30 (3 std below), count=35 (3 std above)
-        level, debug = calculate_congestion_level(35, 30.0, baseline)
+        # Current speed 20 is below p25 of 30
+        level, debug = calculate_congestion_level(15, 20.0, percentiles)
         assert level == "HIGH"
-        assert debug["combined_z"] > 1.5
+        assert debug["level_reason"] == "speed_percentile"
 
-    def test_calibrated_moderate_slightly_worse(self):
-        """Test MODERATE when conditions are somewhat worse than normal."""
-        baseline = CellBaseline(
-            avg_speed=60.0,
-            avg_count=20.0,
-            speed_variance=100.0,  # std=10
-            count_variance=25.0,   # std=5
-            sample_count=MIN_SAMPLES_FOR_CALIBRATION
+    def test_calibrated_moderate_between_p25_and_p50(self):
+        """Test MODERATE when current speed is between p25 and p50."""
+        percentiles = CellPercentiles(
+            speed_p25=30.0,
+            speed_p50=45.0,
+            count_p75=25.0,
+            sample_count=MIN_SAMPLES_FOR_PERCENTILES
         )
-        # Current: speed=50 (1 std below), count=25 (1 std above)
-        # Speed Z = 1.0 (inverted), Count Z = 1.0, Combined = 1.0
-        level, debug = calculate_congestion_level(25, 50.0, baseline)
+        # Current speed 35 is between p25 (30) and p50 (45)
+        level, debug = calculate_congestion_level(15, 35.0, percentiles)
         assert level == "MODERATE"
 
-    def test_calibrated_count_only_when_no_speed(self):
-        """Test using count Z-score only when no speed data."""
-        baseline = CellBaseline(
-            avg_speed=60.0,
-            avg_count=20.0,
-            speed_variance=100.0,
-            count_variance=25.0,
-            sample_count=MIN_SAMPLES_FOR_CALIBRATION
+    def test_calibrated_moderate_high_count_good_speed(self):
+        """Test MODERATE when speed is good but count is above p75."""
+        percentiles = CellPercentiles(
+            speed_p25=30.0,
+            speed_p50=45.0,
+            count_p75=25.0,
+            sample_count=MIN_SAMPLES_FOR_PERCENTILES
         )
-        # No current speed, count is 2 std above normal
-        level, debug = calculate_congestion_level(30, None, baseline)
+        # Speed 50 is good (above p50), but count 30 is above p75 (25)
+        level, debug = calculate_congestion_level(30, 50.0, percentiles)
+        assert level == "MODERATE"
+        assert debug["level_reason"] == "high_count_despite_good_speed"
+
+    def test_calibrated_count_only_when_no_speed(self):
+        """Test using count percentiles when no current speed data."""
+        percentiles = CellPercentiles(
+            speed_p25=30.0,
+            speed_p50=45.0,
+            count_p75=20.0,
+            sample_count=MIN_SAMPLES_FOR_PERCENTILES
+        )
+        # No current speed, count 35 is way above p75 (20)
+        level, debug = calculate_congestion_level(35, None, percentiles)
         assert debug["level_reason"] == "count_only"
-        assert level == "HIGH"  # Z > 1.5
+        assert level == "HIGH"  # 35 > 20 * 1.5
+
+    def test_calibrated_count_only_moderate(self):
+        """Test MODERATE with count above p75 but not way above."""
+        percentiles = CellPercentiles(
+            speed_p25=30.0,
+            speed_p50=45.0,
+            count_p75=20.0,
+            sample_count=MIN_SAMPLES_FOR_PERCENTILES
+        )
+        # No current speed, count 25 is above p75 but not > p75 * 1.5
+        level, debug = calculate_congestion_level(25, None, percentiles)
+        assert level == "MODERATE"
 
 
 @pytest.mark.unit
-class TestBaselineStorage:
-    """Test baseline storage and retrieval from Supabase."""
+class TestPercentileRetrieval:
+    """Test percentile retrieval from Supabase."""
 
-    def test_get_baseline_no_database(self):
-        """Test getting baseline when database is not configured."""
-        # When database isn't set up, should return empty baseline
+    def test_get_percentiles_no_database(self):
+        """Test getting percentiles when database is not configured."""
         with patch("src.api.congestion.is_database_configured", return_value=False):
-            baseline = get_baseline("test_cell")
+            percentiles = get_cell_percentiles("test_cell")
 
-        assert baseline.sample_count == 0
-        assert baseline.avg_speed == 0.0
+        assert percentiles.sample_count == 0
+        assert percentiles.speed_p25 is None
 
-    def test_get_baseline_empty(self):
-        """Test getting baseline when none exists in database."""
+    def test_get_percentiles_empty_result(self):
+        """Test getting percentiles when no history exists."""
         mock_session = MagicMock()
-        mock_session.query.return_value.filter.return_value.first.return_value = None
+        mock_result = MagicMock()
+        mock_result.sample_count = 0
+        mock_session.execute.return_value.fetchone.return_value = mock_result
 
         with patch("src.api.congestion.is_database_configured", return_value=True):
             with patch("src.api.congestion.get_db_session", return_value=mock_session):
-                baseline = get_baseline("test_cell")
+                percentiles = get_cell_percentiles("test_cell")
 
-        assert baseline.sample_count == 0
-        assert baseline.avg_speed == 0.0
+        assert percentiles.sample_count == 0
         mock_session.close.assert_called_once()
 
-    def test_get_baseline_with_data(self):
-        """Test getting baseline with existing data in database."""
-        # Create a mock database row
-        mock_row = MagicMock()
-        mock_row.avg_speed = 55.5
-        mock_row.avg_count = 15.0
-        mock_row.speed_variance = 100.0
-        mock_row.count_variance = 25.0
-        mock_row.sample_count = 100
-
+    def test_get_percentiles_with_data(self):
+        """Test getting percentiles with existing history."""
         mock_session = MagicMock()
-        mock_session.query.return_value.filter.return_value.first.return_value = mock_row
+        mock_result = MagicMock()
+        mock_result.speed_p25 = 30.0
+        mock_result.speed_p50 = 45.0
+        mock_result.count_p75 = 25.0
+        mock_result.sample_count = 100
+        mock_session.execute.return_value.fetchone.return_value = mock_result
 
         with patch("src.api.congestion.is_database_configured", return_value=True):
             with patch("src.api.congestion.get_db_session", return_value=mock_session):
-                baseline = get_baseline("test_cell")
+                percentiles = get_cell_percentiles("test_cell")
 
-        assert baseline.avg_speed == 55.5
-        assert baseline.avg_count == 15.0
-        assert baseline.speed_variance == 100.0
-        assert baseline.count_variance == 25.0
-        assert baseline.sample_count == 100
+        assert percentiles.speed_p25 == 30.0
+        assert percentiles.speed_p50 == 45.0
+        assert percentiles.count_p75 == 25.0
+        assert percentiles.sample_count == 100
         mock_session.close.assert_called_once()
 
-    def test_save_baseline_no_database(self):
-        """Test saving baseline when database is not configured (should silently skip)."""
-        baseline = CellBaseline(avg_speed=60.0, sample_count=50)
 
-        # Should not raise an error
+@pytest.mark.unit
+class TestBucketHistorySave:
+    """Test saving bucket data to history table."""
+
+    def test_save_bucket_no_database(self):
+        """Test saving bucket when database is not configured."""
         with patch("src.api.congestion.is_database_configured", return_value=False):
-            save_baseline("test_cell", baseline)
+            result = save_bucket_to_history(
+                "test_cell",
+                datetime.now(timezone.utc),
+                15,
+                50.0
+            )
 
-    def test_save_baseline_new_row(self):
-        """Test saving baseline creates new row when none exists."""
+        assert result == False
+
+    def test_save_bucket_success(self):
+        """Test saving bucket data successfully."""
         mock_session = MagicMock()
-        mock_session.query.return_value.filter.return_value.first.return_value = None
-
-        baseline = CellBaseline(
-            avg_speed=60.0,
-            avg_count=20.0,
-            speed_variance=100.0,
-            count_variance=25.0,
-            sample_count=50
-        )
 
         with patch("src.api.congestion.is_database_configured", return_value=True):
             with patch("src.api.congestion.get_db_session", return_value=mock_session):
-                save_baseline("test_cell", baseline)
+                result = save_bucket_to_history(
+                    "test_cell",
+                    datetime(2024, 1, 15, 8, 30, tzinfo=timezone.utc),
+                    15,
+                    50.0
+                )
 
+        assert result == True
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
         mock_session.close.assert_called_once()
 
+        # Verify the record has correct hour_of_day and day_of_week
+        saved_record = mock_session.add.call_args[0][0]
+        assert saved_record.hour_of_day == 8  # 8 AM
+        assert saved_record.day_of_week == 0  # Monday (Jan 15, 2024)
+
+    def test_save_bucket_with_null_speed(self):
+        """Test saving bucket with no speed data."""
+        mock_session = MagicMock()
+
+        with patch("src.api.congestion.is_database_configured", return_value=True):
+            with patch("src.api.congestion.get_db_session", return_value=mock_session):
+                result = save_bucket_to_history(
+                    "test_cell",
+                    datetime.now(timezone.utc),
+                    15,
+                    None  # No speed data
+                )
+
+        assert result == True
+        saved_record = mock_session.add.call_args[0][0]
+        assert saved_record.avg_speed is None
+
 
 @pytest.mark.unit
-class TestBaselineUpdate:
-    """Test baseline update with new bucket data (now uses Supabase)."""
+class TestFallbackFunction:
+    """Test the internal fallback calculation function."""
 
-    def test_update_first_sample(self):
-        """Test updating baseline with first sample."""
-        mock_session = MagicMock()
-        mock_session.query.return_value.filter.return_value.first.return_value = None
+    def test_fallback_speed_high(self):
+        """Test HIGH when speed is very low."""
+        level = _calculate_congestion_fallback(5, 10.0)
+        assert level == "HIGH"
 
-        with patch("src.api.congestion.is_database_configured", return_value=True):
-            with patch("src.api.congestion.get_db_session", return_value=mock_session):
-                baseline = update_baseline_with_bucket(
-                    "test_cell",
-                    bucket_count=15,
-                    bucket_avg_speed=50.0
-                )
+    def test_fallback_speed_moderate(self):
+        """Test MODERATE when speed is moderately low."""
+        level = _calculate_congestion_fallback(5, 30.0)
+        assert level == "MODERATE"
 
-        assert baseline.avg_count == 15.0
-        assert baseline.avg_speed == 50.0
-        assert baseline.sample_count == 1
+    def test_fallback_speed_low(self):
+        """Test LOW when speed is good."""
+        level = _calculate_congestion_fallback(5, 60.0)
+        assert level == "LOW"
 
-    def test_update_with_ema(self):
-        """Test that update uses exponential moving average."""
-        # Create a mock existing baseline row
-        mock_row = MagicMock()
-        mock_row.avg_speed = 60.0
-        mock_row.avg_count = 20.0
-        mock_row.speed_variance = 100.0
-        mock_row.count_variance = 25.0
-        mock_row.sample_count = 10
+    def test_fallback_count_high(self):
+        """Test HIGH count when no speed data."""
+        level = _calculate_congestion_fallback(FALLBACK_COUNT_HIGH, None)
+        assert level == "HIGH"
 
-        mock_session = MagicMock()
-        # First call is get_baseline, second call is save_baseline
-        mock_session.query.return_value.filter.return_value.first.side_effect = [
-            mock_row,  # get_baseline finds existing row
-            mock_row,  # save_baseline finds existing row to update
-        ]
+    def test_fallback_count_moderate(self):
+        """Test MODERATE count when no speed data."""
+        level = _calculate_congestion_fallback(FALLBACK_COUNT_MODERATE, None)
+        assert level == "MODERATE"
 
-        with patch("src.api.congestion.is_database_configured", return_value=True):
-            with patch("src.api.congestion.get_db_session", return_value=mock_session):
-                baseline = update_baseline_with_bucket(
-                    "test_cell",
-                    bucket_count=30,  # Higher than avg
-                    bucket_avg_speed=40.0,  # Lower than avg
-                    alpha=0.1
-                )
+    def test_fallback_count_low(self):
+        """Test LOW count when no speed data."""
+        level = _calculate_congestion_fallback(5, None)
+        assert level == "LOW"
 
-        # EMA: new_avg = (1-0.1)*60 + 0.1*40 = 54 + 4 = 58
-        assert baseline.avg_speed == 58.0
-        # EMA: new_avg = (1-0.1)*20 + 0.1*30 = 18 + 3 = 21
-        assert baseline.avg_count == 21.0
-        assert baseline.sample_count == 11
+    def test_fallback_good_speed_high_count(self):
+        """Test that good speed with high count gives MODERATE."""
+        level = _calculate_congestion_fallback(FALLBACK_COUNT_HIGH, 60.0)
+        assert level == "MODERATE"  # High count but good speed

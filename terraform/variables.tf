@@ -125,3 +125,14 @@ variable "alert_email" {
   type        = string
   default     = ""
 }
+
+# -----------------------------------------------------------------------------
+# Database Configuration (Supabase)
+# -----------------------------------------------------------------------------
+
+variable "database_url" {
+  description = "PostgreSQL connection URL for Supabase (for historical percentile data)"
+  type        = string
+  default     = ""
+  sensitive   = true
+}

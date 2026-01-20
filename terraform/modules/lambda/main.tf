@@ -142,10 +142,11 @@ resource "aws_lambda_function" "api" {
   # Environment variables
   environment {
     variables = {
-      ENVIRONMENT = var.environment
-      REDIS_HOST  = var.redis_endpoint
-      REDIS_PORT  = var.redis_port
-      LOG_LEVEL   = var.environment == "prod" ? "INFO" : "DEBUG"
+      ENVIRONMENT  = var.environment
+      REDIS_HOST   = var.redis_endpoint
+      REDIS_PORT   = var.redis_port
+      DATABASE_URL = var.database_url  # Supabase PostgreSQL for historical data
+      LOG_LEVEL    = var.environment == "prod" ? "INFO" : "DEBUG"
     }
   }
 

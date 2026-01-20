@@ -134,28 +134,28 @@ HyperLogLog would use less memory but:
 
 ---
 
-## 4. Congestion Detection: Z-Score Based with Historical Baselines
+## 4. Congestion Detection: Percentile-Based with Historical Buckets
 
 ### Decision
-Self-calibrating congestion detection using Z-scores against historical baselines, with fallback to simple thresholds for uncalibrated cells.
+Self-calibrating congestion detection using percentile comparison against historical bucket data, with fallback to simple thresholds for uncalibrated cells.
 
 ### How It Works
 
 Each hexagon cell learns its own "normal" traffic patterns over time:
 
 ```
-1. Collect data: avg_speed, avg_count, and their variances
-2. After 50+ samples, cell is "calibrated"
-3. Z-score = (current - historical_mean) / std_deviation
-4. Combined Z-score from speed + count determines level:
-   - Z > 1.5  → HIGH congestion
-   - Z > 0.5  → MODERATE congestion
-   - Z ≤ 0.5  → LOW congestion
+1. Store raw bucket data: vehicle_count, avg_speed, hour_of_day, day_of_week
+2. After 20+ samples, cell is "calibrated"
+3. Query percentiles using PostgreSQL's PERCENTILE_CONT
+4. Compare current values to historical percentiles:
+   - Speed < p25  → HIGH congestion (slower than 75% of history)
+   - Speed < p50  → MODERATE congestion (slower than typical)
+   - Speed >= p50 → LOW congestion (normal or better)
 ```
 
 ### Fallback Thresholds (Uncalibrated Cells)
 
-When a cell has < 50 samples, use absolute thresholds:
+When a cell has < 20 samples, use absolute thresholds:
 ```
 Speed-based:
 - < 15 km/h → HIGH
@@ -166,26 +166,27 @@ Count-based:
 - 10+ vehicles → MODERATE
 ```
 
-### Why Z-Scores?
+### Why Percentiles?
 
-**Chose Z-score based detection because:**
+**Chose percentile-based detection because:**
+- Easy to understand: "below 25th percentile" vs "1.5 standard deviations"
 - Self-calibrating (highway vs. residential adapts automatically)
-- Accounts for time-of-day patterns as baselines build up
-- Combines both speed and count signals
-- No manual per-cell configuration needed
+- More robust to outliers than mean/std deviation
+- Simple SQL queries (PERCENTILE_CONT) instead of complex algorithms
+- Easy to explain in interviews
 
 **Trade-offs accepted:**
-- Requires time to build baselines (50 samples minimum)
+- Requires time to build history (20 samples minimum)
 - Storage needed for historical data (Supabase PostgreSQL)
-- More complex than simple thresholds
+- Database query per congestion check (but fast with indexes)
 
 ### Storage
 
-Historical baselines stored in Supabase PostgreSQL:
-- `avg_speed`, `avg_count`: Exponential moving averages
-- `speed_variance`, `count_variance`: For standard deviation
-- `sample_count`: Tracks calibration progress
-- Updated via `/v1/baseline/update` endpoint
+Historical bucket data stored in Supabase PostgreSQL (`bucket_history` table):
+- `cell_id`, `bucket_time`: Unique identifier
+- `vehicle_count`, `avg_speed`: Raw bucket data
+- `hour_of_day`, `day_of_week`: For time-aware queries
+- Saved automatically via update-on-write pattern
 
 ---
 
@@ -436,17 +437,19 @@ How Google Maps and Waze actually detect congestion:
 **Why not implemented:** Current data model treats pings as independent events. Would need vehicle tracking and more frequent pings to calculate reliable speeds.
 
 #### Historical Comparison (IMPLEMENTED)
-Compare current values to historical average for that cell using Z-scores:
-- Store rolling averages per cell (avg_speed, avg_count, variances)
-- Congestion = current values significantly deviate from historical baseline
+Compare current values to historical percentiles for that cell:
+- Store raw bucket data per cell (vehicle_count, avg_speed, timestamps)
+- Query percentiles using SQL PERCENTILE_CONT
+- Congestion = current speed below historical 25th/50th percentile
 - Automatically adapts to each location's normal traffic patterns
 
 **Benefits:**
 - Self-calibrating (highway vs. residential street)
-- Combines both speed and count signals
-- No manual threshold tuning needed
+- Easy to understand and explain ("below 25th percentile")
+- Simple SQL queries, no complex algorithms
+- Supports time-aware filtering (hour_of_day, day_of_week)
 
-**Implementation:** Uses Supabase PostgreSQL to store historical baselines with exponential moving average updates.
+**Implementation:** Uses Supabase PostgreSQL to store bucket_history table with raw data.
 
 #### Density-Based (Vehicles per km)
 Normalize vehicle count by road segment length:

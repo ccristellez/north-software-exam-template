@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 from unittest.mock import Mock, patch, MagicMock
 from src.api.main import app
-from src.api.congestion import CellBaseline
+from src.api.congestion import CellPercentiles
 
 
 @pytest.fixture
@@ -26,8 +26,8 @@ def mock_redis():
 
 @pytest.fixture
 def mock_empty_baseline():
-    """Patch get_baseline to return empty baseline (no history)."""
-    return patch("src.api.congestion.get_baseline", return_value=CellBaseline())
+    """Patch get_cell_percentiles to return empty percentiles (no history)."""
+    return patch("src.api.congestion.get_cell_percentiles", return_value=CellPercentiles())
 
 
 @pytest.mark.unit
@@ -67,6 +67,7 @@ class TestCreatePingEndpoint:
 
     def test_create_ping_success(self, client, mock_redis):
         """Test successful ping creation."""
+        mock_redis.incr.return_value = 1  # Rate limit check passes
         mock_redis.sadd.return_value = 1
         mock_redis.scard.return_value = 5
         mock_redis.expire.return_value = True
@@ -92,15 +93,20 @@ class TestCreatePingEndpoint:
         # Verify Redis operations
         mock_redis.sadd.assert_called_once()
         mock_redis.scard.assert_called_once()
-        mock_redis.expire.assert_called_once()
-        expire_call_args = mock_redis.expire.call_args
-        assert expire_call_args[0][1] == 300  # TTL = 300 seconds
+        # expire is called twice: once for rate limit (60s), once for cell bucket (300s)
+        assert mock_redis.expire.call_count == 2
+        # Check that 300 TTL was used for the cell bucket
+        expire_calls = mock_redis.expire.call_args_list
+        ttls = [call[0][1] for call in expire_calls]
+        assert 300 in ttls  # Cell bucket TTL
+        assert 60 in ttls   # Rate limit TTL
 
         # Verify event was published to stream
         mock_redis.xadd.assert_called()
 
     def test_create_ping_with_timestamp(self, client, mock_redis):
         """Test ping creation with explicit timestamp."""
+        mock_redis.incr.return_value = 1  # Rate limit check passes
         mock_redis.sadd.return_value = 1
         mock_redis.scard.return_value = 1
         mock_redis.expire.return_value = True
@@ -157,6 +163,7 @@ class TestCreatePingEndpoint:
         """Test that multiple pings from same device are counted only once."""
         # Simulate the behavior of Redis SADD and SCARD
         # First SADD returns 1 (new member added), second returns 0 (already exists)
+        mock_redis.incr.return_value = 1  # Rate limit check passes
         mock_redis.sadd.side_effect = [1, 0]  # 1st ping adds, 2nd ping already exists
         mock_redis.scard.side_effect = [1, 1]  # Count remains 1 for both
         mock_redis.expire.return_value = True
@@ -186,31 +193,87 @@ class TestCreatePingEndpoint:
 
 
 @pytest.mark.unit
-class TestPingCountEndpoint:
-    """Test suite for GET /v1/pings/count endpoint."""
+class TestRateLimiting:
+    """Test suite for rate limiting functionality."""
 
-    def test_ping_count_with_data(self, client, mock_redis):
-        """Test ping count when data exists."""
-        mock_redis.get.return_value = "42"
+    def test_rate_limit_allows_normal_traffic(self, client, mock_redis):
+        """Test that normal traffic is allowed through."""
+        mock_redis.incr.return_value = 1  # First request
+        mock_redis.sadd.return_value = 1
+        mock_redis.scard.return_value = 1
+        mock_redis.expire.return_value = True
+        mock_redis.xadd.return_value = "1234567890-0"
+
+        ping_data = {"device_id": "device123", "lat": 40.7128, "lon": -74.0060}
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/pings/count")
+            response = client.post("/v1/pings", json=ping_data)
+
+        assert response.status_code == 200
+
+    def test_rate_limit_blocks_excessive_traffic(self, client, mock_redis):
+        """Test that excessive traffic is blocked with 429."""
+        mock_redis.incr.return_value = 101  # Over the limit
+
+        ping_data = {"device_id": "device123", "lat": 40.7128, "lon": -74.0060}
+
+        with patch("src.api.main.get_redis_client", return_value=mock_redis):
+            response = client.post("/v1/pings", json=ping_data)
+
+        assert response.status_code == 429
+        assert "Rate limit exceeded" in response.json()["detail"]
+
+
+@pytest.mark.unit
+class TestBatchPingEndpoint:
+    """Test suite for POST /v1/pings/batch endpoint."""
+
+    def test_batch_ping_success(self, client, mock_redis):
+        """Test successful batch ping processing."""
+        mock_redis.incr.return_value = 1
+        mock_redis.expire.return_value = True
+        mock_pipe = Mock()
+        mock_pipe.execute.return_value = [1, True, 1, True]  # sadd, expire for 2 pings
+        mock_redis.pipeline.return_value = mock_pipe
+
+        batch_data = {
+            "pings": [
+                {"device_id": "car1", "lat": 40.7128, "lon": -74.0060},
+                {"device_id": "car2", "lat": 40.7130, "lon": -74.0062}
+            ]
+        }
+
+        with patch("src.api.main.get_redis_client", return_value=mock_redis):
+            response = client.post("/v1/pings/batch", json=batch_data)
 
         assert response.status_code == 200
         data = response.json()
-        assert data["total_pings"] == 42
-        mock_redis.get.assert_called_once_with("pings:total")
+        assert data["total_pings"] == 2
+        assert data["unique_devices"] == 2
 
-    def test_ping_count_no_data(self, client, mock_redis):
-        """Test ping count when no data exists."""
-        mock_redis.get.return_value = None
+    def test_batch_ping_rate_limited(self, client, mock_redis):
+        """Test batch ping rate limiting."""
+        mock_redis.incr.return_value = 101  # Over limit
+
+        batch_data = {
+            "pings": [
+                {"device_id": "device123", "lat": 40.7128, "lon": -74.0060}
+            ]
+        }
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
-            response = client.get("/v1/pings/count")
+            response = client.post("/v1/pings/batch", json=batch_data)
 
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total_pings"] == 0
+        assert response.status_code == 429
+
+    def test_batch_ping_max_size(self, client):
+        """Test batch ping rejects over 1000 pings."""
+        batch_data = {
+            "pings": [{"device_id": f"car{i}", "lat": 40.7128, "lon": -74.0060} for i in range(1001)]
+        }
+
+        response = client.post("/v1/pings/batch", json=batch_data)
+        assert response.status_code == 422  # Validation error
 
 
 @pytest.mark.unit
@@ -310,14 +373,23 @@ class TestCongestionEndpoint:
         assert response.status_code == 422
 
 
+@pytest.fixture
+def mock_pipeline():
+    """Create a mock Redis pipeline for area queries."""
+    mock_pipe = Mock()
+    return mock_pipe
+
+
 @pytest.mark.unit
 class TestCongestionAreaEndpoint:
     """Test suite for GET /v1/congestion/area endpoint."""
 
     def test_congestion_area_radius_0(self, client, mock_redis, mock_empty_baseline):
         """Test area congestion with radius=0 (single cell)."""
-        mock_redis.scard.return_value = 5
-        mock_redis.lrange.return_value = []
+        # Pipeline returns: 1 count (scard) + 1 speeds list (lrange)
+        mock_pipe = Mock()
+        mock_pipe.execute.return_value = [5, []]  # count=5, no speeds
+        mock_redis.pipeline.return_value = mock_pipe
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
             with mock_empty_baseline:
@@ -332,15 +404,14 @@ class TestCongestionAreaEndpoint:
 
     def test_congestion_area_radius_1(self, client, mock_redis, mock_empty_baseline):
         """Test area congestion with radius=1 (7 cells)."""
-        # Return different counts for different cells
-        call_count = [0]
-
-        def mock_scard(key):
-            call_count[0] += 1
-            return call_count[0] * 2  # Return 2, 4, 6, 8, ...
-
-        mock_redis.scard.side_effect = mock_scard
-        mock_redis.lrange.return_value = []
+        # Pipeline returns: 7 counts + 7 speed lists
+        # Counts: 2, 4, 6, 8, 10, 12, 14 (varying counts)
+        # Speeds: all empty
+        counts = [2, 4, 6, 8, 10, 12, 14]
+        speeds = [[], [], [], [], [], [], []]
+        mock_pipe = Mock()
+        mock_pipe.execute.return_value = counts + speeds
+        mock_redis.pipeline.return_value = mock_pipe
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
             with mock_empty_baseline:
@@ -351,13 +422,15 @@ class TestCongestionAreaEndpoint:
         assert data["radius"] == 1
         assert data["total_cells"] == 7
         assert len(data["cells"]) == 7
-        assert data["total_vehicles"] > 0
+        assert data["total_vehicles"] == sum(counts)
         assert "avg_vehicles_per_cell" in data
 
     def test_congestion_area_default_radius(self, client, mock_redis, mock_empty_baseline):
         """Test area congestion with default radius (should be 1)."""
-        mock_redis.scard.return_value = 5
-        mock_redis.lrange.return_value = []
+        # 7 cells for radius=1
+        mock_pipe = Mock()
+        mock_pipe.execute.return_value = [5] * 7 + [[]] * 7  # 7 counts + 7 empty speed lists
+        mock_redis.pipeline.return_value = mock_pipe
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
             with mock_empty_baseline:
@@ -370,8 +443,10 @@ class TestCongestionAreaEndpoint:
 
     def test_congestion_area_high_congestion(self, client, mock_redis, mock_empty_baseline):
         """Test area congestion with high traffic."""
-        mock_redis.scard.return_value = 40  # High count for all cells
-        mock_redis.lrange.return_value = []
+        # All 7 cells have high counts (40 vehicles each)
+        mock_pipe = Mock()
+        mock_pipe.execute.return_value = [40] * 7 + [[]] * 7
+        mock_redis.pipeline.return_value = mock_pipe
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
             with mock_empty_baseline:
@@ -385,15 +460,9 @@ class TestCongestionAreaEndpoint:
     def test_congestion_area_cells_sorted(self, client, mock_redis, mock_empty_baseline):
         """Test that cells are sorted by count (highest first)."""
         counts = [5, 35, 10, 25, 8, 15, 20]
-        call_index = [0]
-
-        def mock_scard(key):
-            result = counts[call_index[0] % len(counts)]
-            call_index[0] += 1
-            return result
-
-        mock_redis.scard.side_effect = mock_scard
-        mock_redis.lrange.return_value = []
+        mock_pipe = Mock()
+        mock_pipe.execute.return_value = counts + [[]] * 7
+        mock_redis.pipeline.return_value = mock_pipe
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
             with mock_empty_baseline:
@@ -409,8 +478,9 @@ class TestCongestionAreaEndpoint:
 
     def test_congestion_area_center_cell_marked(self, client, mock_redis, mock_empty_baseline):
         """Test that center cell is marked with is_center=True."""
-        mock_redis.scard.return_value = 5
-        mock_redis.lrange.return_value = []
+        mock_pipe = Mock()
+        mock_pipe.execute.return_value = [5] * 7 + [[]] * 7
+        mock_redis.pipeline.return_value = mock_pipe
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
             with mock_empty_baseline:
@@ -427,14 +497,71 @@ class TestCongestionAreaEndpoint:
 
     def test_congestion_area_invalid_radius(self, client, mock_redis, mock_empty_baseline):
         """Test area congestion with invalid radius."""
-        mock_redis.scard.return_value = 5
-        mock_redis.lrange.return_value = []
+        mock_pipe = Mock()
+        mock_pipe.execute.return_value = [5] + [[]]
+        mock_redis.pipeline.return_value = mock_pipe
 
         with patch("src.api.main.get_redis_client", return_value=mock_redis):
             with mock_empty_baseline:
                 response = client.get("/v1/congestion/area?lat=40.7128&lon=-74.0060&radius=invalid")
 
         assert response.status_code == 422
+
+
+@pytest.mark.unit
+class TestFlushCompletedBucketToHistory:
+    """Test suite for flush_completed_bucket_to_history function."""
+
+    def test_flush_skips_when_already_saved(self, mock_redis):
+        """Test that flush returns False when bucket was already saved."""
+        from src.api.main import flush_completed_bucket_to_history
+
+        # Mock: history_saved flag exists
+        mock_redis.exists.return_value = True
+
+        result = flush_completed_bucket_to_history(mock_redis, "test_cell", 100)
+
+        assert result is False
+        mock_redis.exists.assert_called_once()
+        # Should not proceed to check bucket data
+        mock_redis.scard.assert_not_called()
+
+    def test_flush_skips_when_no_data(self, mock_redis):
+        """Test that flush returns False when previous bucket has no data."""
+        from src.api.main import flush_completed_bucket_to_history
+
+        # Mock: no saved flag, but no data in previous bucket
+        mock_redis.exists.return_value = False
+        mock_redis.scard.return_value = 0
+
+        result = flush_completed_bucket_to_history(mock_redis, "test_cell", 100)
+
+        assert result is False
+        mock_redis.exists.assert_called_once()
+        mock_redis.scard.assert_called_once()
+
+    def test_flush_saves_when_data_exists(self, mock_redis):
+        """Test that flush saves data and returns True when previous bucket has data."""
+        from src.api.main import flush_completed_bucket_to_history
+
+        # Mock: no saved flag, previous bucket has data
+        mock_redis.exists.return_value = False
+        mock_redis.scard.return_value = 15
+        mock_redis.lrange.return_value = [b'45.5', b'50.2', b'38.1']
+        mock_redis.setex.return_value = True
+
+        with patch("src.api.main.cong.get_bucket_speeds", return_value=[45.5, 50.2, 38.1]):
+            with patch("src.api.main.cong.save_bucket_to_history", return_value=True) as mock_save:
+                result = flush_completed_bucket_to_history(mock_redis, "test_cell", 100)
+
+        assert result is True
+        # Should mark as saved with 600s TTL
+        mock_redis.setex.assert_called_once()
+        call_args = mock_redis.setex.call_args[0]
+        assert "history_saved" in call_args[0]
+        assert call_args[1] == 600
+        # Should have called save_bucket_to_history
+        mock_save.assert_called_once()
 
 
 @pytest.mark.integration

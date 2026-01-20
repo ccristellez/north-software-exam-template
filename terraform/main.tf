@@ -123,6 +123,9 @@ module "lambda" {
 
   # Alerts
   sns_topic_arn = var.enable_alerts ? aws_sns_topic.alerts[0].arn : null
+
+  # Database (Supabase PostgreSQL for historical data)
+  database_url = var.database_url
 }
 
 # -----------------------------------------------------------------------------

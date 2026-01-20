@@ -3,8 +3,8 @@ Demo script to show congestion detection with speed data.
 
 This script sends pings with varying speeds to demonstrate:
 1. How speed + count determines congestion level
-2. How the Z-score system works with historical baselines
-3. How to trigger baseline updates for calibration
+2. How the percentile-based system compares to historical data
+3. How cells become calibrated after enough samples (20+)
 
 Run the event_consumer.py in another terminal to see the events:
     Terminal 1: python scripts/event_consumer.py
@@ -48,7 +48,7 @@ def main():
         mode_name = "MODERATE TRAFFIC (mixed speeds)"
 
     print("=" * 60)
-    print("CONGESTION DEMO - With Speed Data")
+    print("CONGESTION DEMO - Percentile-Based Detection")
     print("=" * 60)
     print()
     print(f"Location: Times Square, NYC")
@@ -56,10 +56,11 @@ def main():
     print(f"Pings:    {args.count}")
     print(f"Speed:    {speed_range[0]}-{speed_range[1]} km/h")
     print()
-    print("The system uses both COUNT and SPEED to determine congestion:")
-    print("  - High count + slow speed = HIGH congestion")
-    print("  - Low count + fast speed = LOW congestion")
-    print("  - Z-scores compare current vs historical baseline")
+    print("The system uses SPEED compared to historical percentiles:")
+    print("  - Speed < 25th percentile = HIGH congestion")
+    print("  - Speed < 50th percentile = MODERATE congestion")
+    print("  - Speed >= 50th percentile = LOW congestion")
+    print("  - Falls back to absolute thresholds if < 20 samples")
     print()
     print("-" * 60)
 
@@ -116,47 +117,50 @@ def main():
 
     print()
     print("CONGESTION STATUS:")
-    print(f"  Cell ID:      {data['cell_id']}")
+    print(f"  Cell ID:       {data['cell_id']}")
     print(f"  Vehicle Count: {data['vehicle_count']}")
-    print(f"  Avg Speed:     {data['avg_speed_kmh']} km/h")
+    print(f"  Avg Speed:     {data.get('avg_speed_kmh', 'N/A')} km/h")
     print(f"  Level:         {data['congestion_level']}")
-    print(f"  Calibrated:    {data['calibrated']}")
+    print(f"  Calibrated:    {data.get('calibrated', False)}")
     print()
 
     # Show debug info if available
     if "debug" in data:
         debug = data["debug"]
-        print("Z-SCORE DEBUG:")
+        print("PERCENTILE DEBUG:")
         print(f"  Method:        {debug.get('method', 'N/A')}")
         print(f"  Sample Count:  {debug.get('sample_count', 0)}")
-        if debug.get("method") == "calibrated":
-            print(f"  Count Z-score: {debug.get('count_z', 'N/A')}")
-            print(f"  Speed Z-score: {debug.get('speed_z', 'N/A')}")
-            print(f"  Combined Z:    {debug.get('combined_z', 'N/A')}")
+        if debug.get("method") == "percentile":
+            print(f"  Speed p25:     {debug.get('speed_p25', 'N/A')} km/h")
+            print(f"  Speed p50:     {debug.get('speed_p50', 'N/A')} km/h")
+            print(f"  Count p75:     {debug.get('count_p75', 'N/A')}")
         print(f"  Reason:        {debug.get('level_reason', 'N/A')}")
     print()
 
-    # Show baseline info
+    # Show historical percentiles
     print("-" * 60)
-    response = requests.get(f"{API_URL}/v1/baseline", params=DEMO_LOCATION)
-    baseline = response.json()
+    response = requests.get(f"{API_URL}/v1/history", params=DEMO_LOCATION)
 
-    print("BASELINE (Historical Data):")
-    print(f"  Avg Speed:     {baseline['avg_speed_kmh']} km/h")
-    print(f"  Avg Count:     {baseline['avg_count']}")
-    print(f"  Speed Std:     {baseline['speed_std']}")
-    print(f"  Count Std:     {baseline['count_std']}")
-    print(f"  Samples:       {baseline['sample_count']}")
-    print(f"  Calibrated:    {baseline['is_calibrated']} (needs {baseline['min_samples_required']})")
+    if response.status_code == 200:
+        history = response.json()
+        print("HISTORICAL PERCENTILES:")
+        print(f"  Speed p25:     {history.get('speed_p25', 'N/A')} km/h (slow)")
+        print(f"  Speed p50:     {history.get('speed_p50', 'N/A')} km/h (median)")
+        print(f"  Count p75:     {history.get('count_p75', 'N/A')} (busy)")
+        print(f"  Samples:       {history.get('sample_count', 0)}")
+        print(f"  Calibrated:    {history.get('is_calibrated', False)} (needs 20)")
+    else:
+        print("HISTORICAL PERCENTILES: Not available (no database configured)")
     print()
 
-    # Offer to update baseline
+    # Tips for building up history
     print("-" * 60)
-    print("TIP: To build up the baseline, run this command:")
-    print(f"  curl -X POST '{API_URL}/v1/baseline/update?lat={DEMO_LOCATION['lat']}&lon={DEMO_LOCATION['lon']}'")
+    print("TIP: To build historical data for percentile calibration:")
     print()
-    print("Or run the load test to generate lots of data:")
-    print("  python scripts/load_test.py --requests 500 --traffic moderate")
+    print("  python tests/load_test.py --populate --days 7 --cells 5")
+    print()
+    print("This will insert realistic traffic data directly into the database.")
+    print("After 20+ samples, the cell becomes 'calibrated' and uses percentiles.")
     print("=" * 60)
 
 

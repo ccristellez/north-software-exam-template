@@ -1,67 +1,54 @@
 """
-Congestion calculation module using historical baselines and Z-scores.
+Congestion calculation module using percentile-based detection.
 
-This module implements a self-calibrating congestion detection system where each
-hexagon cell learns its own "normal" traffic patterns over time. Congestion levels
-are determined by comparing current conditions to the cell's historical baseline
-using Z-scores (standard deviations from the mean).
+This module implements congestion detection by comparing current conditions
+to historical percentiles. The approach:
+1. Store each completed bucket's data in PostgreSQL (bucket_history table)
+2. Query historical percentiles using SQL PERCENTILE_CONT
+3. Compare current speed/count to historical 25th/50th percentiles
+4. Fall back to absolute thresholds for cells with insufficient history
 
-Key concepts:
-- Each cell builds a baseline: avg_speed, avg_count, and their standard deviations
-- Z-score measures how far current values deviate from the baseline
-- Speed below normal = bad (positive Z), Count above normal = bad (positive Z)
-- Combined Z-score determines congestion level
-
-Storage:
-- Historical baselines are stored in Supabase (PostgreSQL) for durability
-- Real-time speed data stays in Redis (ephemeral, expires with buckets)
+Why percentiles instead of Z-scores?
+- Easier to understand: "below 25th percentile" vs "1.5 standard deviations"
+- Easier to explain in interviews
+- More robust to outliers than mean/std
+- Simple SQL queries instead of Welford's algorithm
 """
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from redis import Redis
+from sqlalchemy import text
 
-# Import our database stuff
-from .database import get_db_session, HexBaseline, is_database_configured
+from .database import get_db_session, BucketHistory, is_database_configured
 
-# Minimum samples before using historical calibration
-# Below this threshold, fall back to absolute thresholds
-MIN_SAMPLES_FOR_CALIBRATION = 50
+# Minimum bucket history records before using percentile-based detection
+MIN_SAMPLES_FOR_PERCENTILES = 20
 
-# Fallback thresholds when no historical data exists
+# Fallback thresholds when insufficient history exists
 FALLBACK_SPEED_HIGH = 15      # Below this km/h = HIGH congestion
 FALLBACK_SPEED_MODERATE = 40  # Below this km/h = MODERATE congestion
 FALLBACK_COUNT_HIGH = 30      # Above this count = HIGH congestion
 FALLBACK_COUNT_MODERATE = 10  # Above this count = MODERATE congestion
 
-# Z-score thresholds for congestion levels
-Z_THRESHOLD_HIGH = 1.5      # Z > 1.5 = HIGH congestion
-Z_THRESHOLD_MODERATE = 0.5  # Z > 0.5 = MODERATE congestion
-
 
 @dataclass
-class CellBaseline:
-    """Historical baseline statistics for a single hexagon cell."""
-    avg_speed: float = 0.0
-    avg_count: float = 0.0
-    speed_variance: float = 0.0  # We store variance, calculate std when needed
-    count_variance: float = 0.0
+class CellPercentiles:
+    """Historical percentile statistics for a cell."""
+    speed_p25: Optional[float] = None  # 25th percentile speed
+    speed_p50: Optional[float] = None  # 50th percentile (median) speed
+    count_p75: Optional[float] = None  # 75th percentile count
     sample_count: int = 0
 
     @property
-    def speed_std(self) -> float:
-        """Standard deviation of speed."""
-        return self.speed_variance ** 0.5 if self.speed_variance > 0 else 1.0
-
-    @property
-    def count_std(self) -> float:
-        """Standard deviation of count."""
-        return self.count_variance ** 0.5 if self.count_variance > 0 else 1.0
+    def has_speed_data(self) -> bool:
+        """Whether we have enough speed history."""
+        return self.speed_p25 is not None and self.speed_p50 is not None
 
     @property
     def is_calibrated(self) -> bool:
-        """Whether we have enough samples to use historical calibration."""
-        return self.sample_count >= MIN_SAMPLES_FOR_CALIBRATION
+        """Whether we have enough history to use percentile-based detection."""
+        return self.sample_count >= MIN_SAMPLES_FOR_PERCENTILES
 
 
 def get_speed_key(cell_id: str, bucket: int) -> str:
@@ -69,90 +56,100 @@ def get_speed_key(cell_id: str, bucket: int) -> str:
     return f"cell:{cell_id}:bucket:{bucket}:speeds"
 
 
-def get_baseline(cell_id: str) -> CellBaseline:
+def get_cell_percentiles(cell_id: str, hours_back: int = 168) -> CellPercentiles:
     """
-    Get historical baseline for a cell from Supabase.
+    Get historical percentiles for a cell from the database.
 
-    Returns an empty baseline if:
-    - Database isn't configured (allows tests to run)
-    - No data exists for this cell yet
-    - Database connection fails (graceful degradation)
+    Uses PostgreSQL's PERCENTILE_CONT for accurate percentile calculation.
+    Default looks back 7 days (168 hours).
+
+    Args:
+        cell_id: H3 cell ID
+        hours_back: How many hours of history to consider (default 7 days)
+
+    Returns:
+        CellPercentiles with speed_p25, speed_p50, count_p75, and sample_count
     """
-    # If no database, return empty baseline (useful for tests)
     if not is_database_configured():
-        return CellBaseline()
+        return CellPercentiles()
 
     session = get_db_session()
     if session is None:
-        return CellBaseline()
+        return CellPercentiles()
 
     try:
-        # Look up the baseline in Supabase
-        row = session.query(HexBaseline).filter(HexBaseline.cell_id == cell_id).first()
+        # Query percentiles using PostgreSQL's PERCENTILE_CONT
+        result = session.execute(
+            text("""
+                SELECT
+                    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY avg_speed) as speed_p25,
+                    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY avg_speed) as speed_p50,
+                    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY vehicle_count) as count_p75,
+                    COUNT(*) as sample_count
+                FROM bucket_history
+                WHERE cell_id = :cell_id
+                  AND bucket_time > NOW() - INTERVAL ':hours hours'
+            """.replace(":hours", str(hours_back))),
+            {"cell_id": cell_id}
+        ).fetchone()
 
-        if row is None:
-            return CellBaseline()
+        if result is None or result.sample_count == 0:
+            return CellPercentiles()
 
-        # Convert database row to our dataclass
-        return CellBaseline(
-            avg_speed=row.avg_speed or 0.0,
-            avg_count=row.avg_count or 0.0,
-            speed_variance=row.speed_variance or 0.0,
-            count_variance=row.count_variance or 0.0,
-            sample_count=row.sample_count or 0
+        return CellPercentiles(
+            speed_p25=result.speed_p25,
+            speed_p50=result.speed_p50,
+            count_p75=result.count_p75,
+            sample_count=result.sample_count
         )
     except Exception:
-        # Connection error - return empty baseline (graceful degradation)
-        return CellBaseline()
+        return CellPercentiles()
     finally:
         session.close()
 
 
-def save_baseline(cell_id: str, baseline: CellBaseline) -> bool:
+def save_bucket_to_history(
+    cell_id: str,
+    bucket_time: datetime,
+    vehicle_count: int,
+    avg_speed: Optional[float]
+) -> bool:
     """
-    Save baseline data to Supabase.
+    Save a completed bucket's data to the history table.
 
-    Uses upsert logic - creates new row or updates existing one.
+    Args:
+        cell_id: H3 cell ID
+        bucket_time: When the bucket started (UTC)
+        vehicle_count: Number of unique devices in the bucket
+        avg_speed: Average speed in km/h (or None if no speed data)
 
     Returns:
         True if saved successfully, False otherwise
     """
     if not is_database_configured():
-        return False  # No database configured
+        return False
 
     session = get_db_session()
     if session is None:
         return False
 
     try:
-        # Check if row exists
-        row = session.query(HexBaseline).filter(HexBaseline.cell_id == cell_id).first()
+        # Extract time components for time-aware queries
+        hour_of_day = bucket_time.hour
+        day_of_week = bucket_time.weekday()  # 0=Monday, 6=Sunday
 
-        if row is None:
-            # Create new row
-            row = HexBaseline(
-                cell_id=cell_id,
-                avg_speed=baseline.avg_speed,
-                avg_count=baseline.avg_count,
-                speed_variance=baseline.speed_variance,
-                count_variance=baseline.count_variance,
-                sample_count=baseline.sample_count,
-                updated_at=datetime.now(timezone.utc)
-            )
-            session.add(row)
-        else:
-            # Update existing row
-            row.avg_speed = baseline.avg_speed
-            row.avg_count = baseline.avg_count
-            row.speed_variance = baseline.speed_variance
-            row.count_variance = baseline.count_variance
-            row.sample_count = baseline.sample_count
-            row.updated_at = datetime.now(timezone.utc)
-
+        record = BucketHistory(
+            cell_id=cell_id,
+            bucket_time=bucket_time,
+            vehicle_count=vehicle_count,
+            avg_speed=avg_speed,
+            hour_of_day=hour_of_day,
+            day_of_week=day_of_week
+        )
+        session.add(record)
         session.commit()
         return True
     except Exception:
-        # Connection error - graceful degradation
         session.rollback()
         return False
     finally:
@@ -161,7 +158,7 @@ def save_baseline(cell_id: str, baseline: CellBaseline) -> bool:
 
 def record_speed(r: Redis, cell_id: str, bucket: int, speed_kmh: float) -> None:
     """
-    Record a speed reading for a cell+bucket.
+    Record a speed reading for a cell+bucket in Redis.
 
     Args:
         r: Redis client
@@ -176,7 +173,7 @@ def record_speed(r: Redis, cell_id: str, bucket: int, speed_kmh: float) -> None:
 
 def get_bucket_speeds(r: Redis, cell_id: str, bucket: int) -> list[float]:
     """
-    Get all speed readings for a cell+bucket.
+    Get all speed readings for a cell+bucket from Redis.
 
     Args:
         r: Redis client
@@ -191,43 +188,25 @@ def get_bucket_speeds(r: Redis, cell_id: str, bucket: int) -> list[float]:
     return [float(s) for s in speeds] if speeds else []
 
 
-def calculate_z_score(value: float, mean: float, std: float, invert: bool = False) -> float:
-    """
-    Calculate Z-score (how many standard deviations from mean).
-
-    Args:
-        value: Current value
-        mean: Historical mean
-        std: Historical standard deviation
-        invert: If True, flip the sign (for speed where lower = worse)
-
-    Returns:
-        Z-score (positive = worse than normal for congestion)
-    """
-    if std <= 0:
-        std = 1.0  # Prevent division by zero
-
-    z = (mean - value) / std if invert else (value - mean) / std
-    return z
-
-
 def calculate_congestion_level(
     current_count: int,
     current_avg_speed: Optional[float],
-    baseline: CellBaseline
+    percentiles: CellPercentiles
 ) -> Tuple[str, dict]:
     """
-    Calculate congestion level using Z-scores against historical baseline.
+    Calculate congestion level using percentile comparison.
 
-    The algorithm:
-    1. If baseline is calibrated (enough samples), use Z-scores
-    2. Otherwise, fall back to absolute thresholds
-    3. Combine speed Z-score and count Z-score for final determination
+    Algorithm:
+    1. If we have enough history, compare current values to percentiles
+    2. Speed below 25th percentile = HIGH congestion
+    3. Speed below 50th percentile = MODERATE congestion
+    4. Otherwise = LOW congestion
+    5. Fall back to absolute thresholds if insufficient history
 
     Args:
         current_count: Number of unique devices in current bucket
         current_avg_speed: Average speed in current bucket (None if no speed data)
-        baseline: Historical baseline for this cell
+        percentiles: Historical percentiles for this cell
 
     Returns:
         Tuple of (congestion_level, debug_info)
@@ -235,55 +214,59 @@ def calculate_congestion_level(
         - debug_info: Dictionary with calculation details
     """
     debug_info = {
-        "method": "calibrated" if baseline.is_calibrated else "fallback",
-        "sample_count": baseline.sample_count,
-        "baseline_avg_speed": baseline.avg_speed,
-        "baseline_avg_count": baseline.avg_count,
+        "method": "percentile" if percentiles.is_calibrated else "fallback",
+        "sample_count": percentiles.sample_count,
         "current_count": current_count,
         "current_avg_speed": current_avg_speed,
     }
 
-    # Not enough historical data - use fallback thresholds
-    if not baseline.is_calibrated:
-        level = _fallback_congestion(current_count, current_avg_speed)
+    # Not enough history - use absolute thresholds
+    if not percentiles.is_calibrated:
+        level = _calculate_congestion_fallback(current_count, current_avg_speed)
         debug_info["level_reason"] = "insufficient_history"
         return level, debug_info
 
-    # Calculate Z-scores
-    # For count: higher than normal = worse (positive Z)
-    count_z = calculate_z_score(current_count, baseline.avg_count, baseline.count_std)
-    debug_info["count_z"] = round(count_z, 2)
+    # Add percentile values to debug info
+    debug_info["speed_p25"] = percentiles.speed_p25
+    debug_info["speed_p50"] = percentiles.speed_p50
+    debug_info["count_p75"] = percentiles.count_p75
 
-    # For speed: lower than normal = worse (we invert so positive Z = worse)
-    if current_avg_speed is not None and baseline.avg_speed > 0:
-        speed_z = calculate_z_score(current_avg_speed, baseline.avg_speed, baseline.speed_std, invert=True)
-        debug_info["speed_z"] = round(speed_z, 2)
+    # Use speed as primary signal (if available)
+    if current_avg_speed is not None and percentiles.has_speed_data:
+        debug_info["level_reason"] = "speed_percentile"
 
-        # Combined Z-score: average of both signals
-        combined_z = (count_z + speed_z) / 2
-        debug_info["combined_z"] = round(combined_z, 2)
-        debug_info["level_reason"] = "speed_and_count"
+        if current_avg_speed < percentiles.speed_p25:
+            # Below 25th percentile = worst 25% of historical speeds
+            return "HIGH", debug_info
+        elif current_avg_speed < percentiles.speed_p50:
+            # Below median = worse than typical
+            return "MODERATE", debug_info
+        else:
+            # At or above median = normal or better
+            # But check if count is unusually high
+            if percentiles.count_p75 and current_count > percentiles.count_p75:
+                debug_info["level_reason"] = "high_count_despite_good_speed"
+                return "MODERATE", debug_info
+            return "LOW", debug_info
+
+    # No speed data - use count percentiles only
+    debug_info["level_reason"] = "count_only"
+
+    if percentiles.count_p75 and current_count > percentiles.count_p75 * 1.5:
+        # Way above 75th percentile
+        return "HIGH", debug_info
+    elif percentiles.count_p75 and current_count > percentiles.count_p75:
+        # Above 75th percentile
+        return "MODERATE", debug_info
     else:
-        # No speed data - use count Z-score only
-        combined_z = count_z
-        debug_info["combined_z"] = round(combined_z, 2)
-        debug_info["level_reason"] = "count_only"
-
-    # Determine level from combined Z-score
-    if combined_z >= Z_THRESHOLD_HIGH:
-        level = "HIGH"
-    elif combined_z >= Z_THRESHOLD_MODERATE:
-        level = "MODERATE"
-    else:
-        level = "LOW"
-
-    return level, debug_info
+        return "LOW", debug_info
 
 
-def _fallback_congestion(count: int, avg_speed: Optional[float]) -> str:
+def _calculate_congestion_fallback(count: int, avg_speed: Optional[float]) -> str:
     """
-    Fallback congestion calculation using absolute thresholds.
-    Used when historical baseline is not yet calibrated.
+    Calculate congestion using absolute thresholds (fallback mode).
+
+    Used when a cell has insufficient historical data for percentile comparison.
 
     Args:
         count: Number of devices
@@ -292,18 +275,18 @@ def _fallback_congestion(count: int, avg_speed: Optional[float]) -> str:
     Returns:
         Congestion level: "LOW", "MODERATE", or "HIGH"
     """
-    # If we have speed data, prioritize it
+    # Speed is the primary signal (if available)
     if avg_speed is not None:
         if avg_speed < FALLBACK_SPEED_HIGH:
             return "HIGH"
         elif avg_speed < FALLBACK_SPEED_MODERATE:
             return "MODERATE"
-        # Speed is good, but check count too
+        # Good speed - check count as secondary signal
         if count >= FALLBACK_COUNT_HIGH:
-            return "MODERATE"  # High count but good speed = moderate
+            return "MODERATE"  # High count but good speed
         return "LOW"
 
-    # No speed data - use count only (original behavior)
+    # No speed data - use count only
     if count >= FALLBACK_COUNT_HIGH:
         return "HIGH"
     elif count >= FALLBACK_COUNT_MODERATE:
@@ -311,61 +294,14 @@ def _fallback_congestion(count: int, avg_speed: Optional[float]) -> str:
     return "LOW"
 
 
-def update_baseline_with_bucket(
-    cell_id: str,
-    bucket_count: int,
-    bucket_avg_speed: Optional[float],
-    alpha: float = 0.1
-) -> CellBaseline:
+# =============================================================================
+# Convenience function for backward compatibility
+# =============================================================================
+
+def get_baseline(cell_id: str) -> CellPercentiles:
     """
-    Update a cell's baseline with data from a completed bucket.
+    Get historical data for a cell. Alias for get_cell_percentiles.
 
-    Uses exponential moving average (EMA) to weight recent data more heavily
-    while still maintaining historical context. Also updates variance using
-    Welford's online algorithm adaptation.
-
-    The baseline is stored in Supabase so it survives server restarts.
-
-    Args:
-        cell_id: H3 cell ID
-        bucket_count: Device count from the completed bucket
-        bucket_avg_speed: Average speed from the completed bucket (or None)
-        alpha: Smoothing factor (0.1 = 10% weight to new data)
-
-    Returns:
-        Updated CellBaseline
+    Kept for backward compatibility with existing code.
     """
-    # Get current baseline from Supabase
-    baseline = get_baseline(cell_id)
-
-    # First sample - initialize directly
-    if baseline.sample_count == 0:
-        baseline.avg_count = float(bucket_count)
-        if bucket_avg_speed is not None:
-            baseline.avg_speed = bucket_avg_speed
-        baseline.sample_count = 1
-        save_baseline(cell_id, baseline)
-        return baseline
-
-    # Update count statistics using EMA
-    old_avg_count = baseline.avg_count
-    baseline.avg_count = (1 - alpha) * baseline.avg_count + alpha * bucket_count
-
-    # Update count variance (adapted Welford's algorithm with EMA)
-    count_diff = bucket_count - old_avg_count
-    baseline.count_variance = (1 - alpha) * baseline.count_variance + alpha * (count_diff ** 2)
-
-    # Update speed statistics if we have speed data
-    if bucket_avg_speed is not None:
-        if baseline.avg_speed > 0:
-            old_avg_speed = baseline.avg_speed
-            baseline.avg_speed = (1 - alpha) * baseline.avg_speed + alpha * bucket_avg_speed
-            speed_diff = bucket_avg_speed - old_avg_speed
-            baseline.speed_variance = (1 - alpha) * baseline.speed_variance + alpha * (speed_diff ** 2)
-        else:
-            # First speed reading
-            baseline.avg_speed = bucket_avg_speed
-
-    baseline.sample_count += 1
-    save_baseline(cell_id, baseline)
-    return baseline
+    return get_cell_percentiles(cell_id)
