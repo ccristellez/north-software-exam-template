@@ -1,8 +1,8 @@
 # Design Decisions & Trade-offs
 
-## Overview
+This document explains the **why** behind architectural choices: technology decisions, trade-offs accepted, and scaling strategy.
 
-This document explains the key architectural decisions, their trade-offs, and how the system would scale in production.
+For system diagrams, data models, and component structure, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ---
 
@@ -190,7 +190,79 @@ Historical bucket data stored in Supabase PostgreSQL (`bucket_history` table):
 
 ---
 
-## 5. API Design
+## 5. History Update Strategy
+
+### Decision
+Update-on-Write pattern: save previous bucket to history when a new ping arrives.
+
+### Why Update-on-Write?
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Update-on-Write (chosen)** | No external dependencies, simple, auto-updates | Data lost if cell has traffic then goes quiet |
+| Update-on-Read | Simple | Data lost for unqueried cells |
+| Background Job (cron/Lambda) | Complete data capture | Requires external scheduler, more infrastructure |
+| Save Every Ping | No data loss | Corrupts variance with partial bucket data |
+
+### Trade-offs Accepted
+
+**Chose Update-on-Write because:**
+- No cron jobs, Lambda functions, or external schedulers required
+- Cells with consistent traffic always get baselines updated
+- Acceptable for MVP: cells that go quiet probably don't need baseline updates
+
+**Accepted limitation:**
+If a cell receives traffic in bucket N but zero traffic in bucket N+1, bucket N's data is lost when Redis TTL expires. Rare in practice for active cells.
+
+---
+
+## 6. Historical Data Storage
+
+### Decision
+Store raw bucket data in PostgreSQL, compute percentiles on read.
+
+### Why Raw Buckets?
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Store raw buckets (chosen)** | Debuggable, flexible queries, easy to explain | Slightly more storage |
+| Store computed stats (Welford) | Less storage | Complex math, hard to debug/explain |
+| Store all individual pings | Maximum flexibility | Excessive storage growth |
+
+### Trade-offs Accepted
+
+**Chose raw bucket storage because:**
+- Easy to query and debug with standard SQL
+- PERCENTILE_CONT handles the math
+- Supports time-of-day filtering with simple WHERE clauses
+- No complex algorithms to explain
+- Storage is cheap; simplicity is valuable
+
+---
+
+## 7. Area Query Optimization
+
+### Decision
+Use Redis pipeline for batch queries across multiple cells.
+
+### Why Pipelines?
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Redis pipeline (chosen)** | 1 round-trip for N cells | Slightly more complex code |
+| Individual queries | Simple code | N round-trips = high latency |
+| Cached aggregates | Fast reads | Stale data, complex invalidation |
+
+### Trade-offs Accepted
+
+**Chose Redis pipelines because:**
+- For radius=2 (19 cells): 38 round-trips → 1 round-trip
+- Dramatically reduces latency for area queries
+- Minimal code complexity increase
+
+---
+
+## 8. API Design
 
 ### Decision
 RESTful JSON API with three main endpoints.
@@ -221,7 +293,7 @@ RESTful JSON API with three main endpoints.
 
 ---
 
-## 6. Event-Driven Architecture: Redis Streams
+## 9. Event-Driven Architecture: Redis Streams
 
 ### Decision
 Publish events to a Redis Stream when pings are received, enabling downstream consumers without coupling them to the API.
@@ -281,7 +353,7 @@ Streams provide durability - consumers can catch up after downtime.
 
 ---
 
-## 7. Observability: Prometheus Metrics
+## 10. Observability: Prometheus Metrics
 
 ### Decision
 Built-in Prometheus metrics endpoint at `/metrics`.
@@ -311,7 +383,7 @@ Built-in Prometheus metrics endpoint at `/metrics`.
 
 ---
 
-## 8. Infrastructure: Serverless on AWS
+## 11. Infrastructure: Serverless on AWS
 
 ### Decision
 Deploy as AWS Lambda behind API Gateway, with ElastiCache Redis.
@@ -346,7 +418,7 @@ Deploy as AWS Lambda behind API Gateway, with ElastiCache Redis.
 
 ---
 
-## 9. Scalability Analysis
+## 12. Scalability Analysis
 
 ### Current Limits
 
@@ -383,19 +455,25 @@ At 100,000 pings/second:
 └── Network: ✓
 ```
 
-### Cost Estimate (AWS)
+### Cost Estimate (AWS us-east-1)
 
-| Component | Estimate/month | Notes |
-|-----------|----------------|-------|
-| Lambda | $0-50 | Free tier covers light use |
-| API Gateway | $3.50/million requests | |
-| ElastiCache | $25-100 | cache.t3.micro to cache.r6g.large |
-| CloudWatch | $5-20 | Logs and metrics |
-| **Total** | **$35-200** | Depending on traffic |
+| Traffic Level | Requests/Day | Lambda | ElastiCache | API Gateway | Supabase | Total |
+|---------------|--------------|--------|-------------|-------------|----------|-------|
+| **Dev/Test** | 10k | $0 (free tier) | $12 (cache.t3.micro) | $0.04 | $0 (free) | **~$12/mo** |
+| **Light** | 100k | $0 (free tier) | $12 (cache.t3.micro) | $0.35 | $25 (Pro) | **~$37/mo** |
+| **Medium** | 1M | $2 | $25 (cache.t3.small) | $3.50 | $25 (Pro) | **~$56/mo** |
+| **Heavy** | 10M | $20 | $50 (cache.m6g.large) | $35 | $25 (Pro) | **~$130/mo** |
+| **Scale** | 100M | $200 | $200 (cluster) | $350 | $599 (Team) | **~$1,350/mo** |
+
+**Pricing breakdown:**
+- **Lambda**: $0.20 per 1M requests + $0.0000166667/GB-sec (128MB, 100ms avg)
+- **API Gateway**: $3.50 per million requests (REST API)
+- **ElastiCache**: cache.t3.micro=$0.017/hr, cache.t3.small=$0.034/hr, cache.m6g.large=$0.068/hr
+- **Supabase**: Free (500MB), Pro $25/mo (8GB), Team $599/mo (unlimited)
 
 ---
 
-## 10. Security Considerations
+## 13. Security Considerations
 
 ### Implemented
 - Input validation via Pydantic
@@ -411,7 +489,7 @@ At 100,000 pings/second:
 
 ---
 
-## 11. Future Improvements
+## 14. Future Improvements
 
 ### Alternative Congestion Detection Approaches
 
@@ -484,6 +562,22 @@ Trigger on sudden changes rather than absolute values:
 
 ---
 
+## Technology Summary
+
+| Technology | Why Chosen | Alternatives Considered |
+|------------|------------|------------------------|
+| **FastAPI** | Async support, automatic OpenAPI docs, Pydantic validation, Lambda-ready | Flask (no async), Django (too heavy) |
+| **Redis** | O(1) SET operations, built-in TTL, perfect for ephemeral counting | PostgreSQL (too slow for writes), DynamoDB (more complex) |
+| **H3 Hexagons** | Uniform cell sizes, equidistant neighbors, efficient k-ring queries | Geohash (rectangular, edge distortion), S2 (more complex) |
+| **PostgreSQL** | Durable storage, PERCENTILE_CONT for stats, time-of-day queries | Store stats in Redis (no durability), NoSQL (harder queries) |
+| **Redis Streams** | Already have Redis, built-in persistence, simple XREAD consumer | Kafka (overkill), SQS (cloud-only) |
+| **Prometheus** | Industry standard, pull-based simplicity, Grafana integration | CloudWatch (AWS-only), custom metrics |
+| **Lambda** | Auto-scaling, pay-per-use, zero ops | ECS (more ops), EC2 (manual scaling) |
+
+**Core principle:** Use the simplest technology that solves the problem well.
+
+---
+
 ## Summary
 
 This design prioritizes:
@@ -492,4 +586,4 @@ This design prioritizes:
 3. **Correctness** - Unique device counting, proper spatial indexing
 4. **Operability** - Metrics, health checks, infrastructure as code
 
-Trade-offs favor operational simplicity over theoretical optimality, which is appropriate for an MVP that can evolve based on real usage patterns.
+Trade-offs favor operational simplicity over theoretical optimality—appropriate for an MVP that can evolve based on real usage patterns.
