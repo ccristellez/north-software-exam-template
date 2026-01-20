@@ -6,15 +6,20 @@ We use Supabase to store bucket history because:
 - Redis is better for ephemeral real-time data (current bucket counts/speeds)
 - PostgreSQL gives us durability and powerful percentile queries
 """
+import os
 from datetime import datetime, timezone
+
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 
-# TAKE-HOME ONLY: Hardcoded for simplicity. In production, this would be loaded
-# from environment variables or a secrets manager (AWS Secrets Manager, HashiCorp
-# Vault, etc.) and never committed to source control.
-DATABASE_URL = "postgresql://postgres.uoqpvedhocxtduspgcrn:FflaWsf8Znh0tTwH@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
+# Load environment variables from .env file
+load_dotenv()
+
+# Database URL loaded from environment variable
+# Set SUPABASE_DATABASE_URL in your .env file or environment
+DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL")
 
 # Create engine and session factory
 # We only create these if DATABASE_URL is set (allows tests to run without DB)
